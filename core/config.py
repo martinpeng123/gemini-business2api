@@ -54,6 +54,10 @@ class BasicConfig(BaseModel):
     refresh_window_hours: int = Field(default=1, ge=0, le=24, description="过期刷新窗口（小时）")
     register_default_count: int = Field(default=1, ge=1, le=30, description="默认注册数量")
     register_domain: str = Field(default="", description="默认注册域名（推荐）")
+    claude_optimize_system_prompt: bool = Field(
+        default=True,
+        description="是否优化 Claude system prompt（替换为 Gemini 友好版本，避免 Payload 过大）"
+    )
 
 
 class ImageGenerationConfig(BaseModel):

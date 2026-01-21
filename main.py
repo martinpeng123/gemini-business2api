@@ -76,6 +76,9 @@ from core.config import config_manager, config
 # 数据库存储支持
 from core import storage
 
+# 导入 Gemini CLI 路由
+from routers import gemini_cli_router, gemini_api_router, claude_code_router, claude_api_router
+
 # ---------- 日志配置 ----------
 
 # 内存日志缓冲区 (保留最近 1000 条日志，重启后清空)
@@ -477,6 +480,17 @@ if IMAGE_DIR == "/data/images":
     logger.info(f"[SYSTEM] 图片静态服务已启用: /images/ -> {IMAGE_DIR} (HF Pro持久化)")
 else:
     logger.info(f"[SYSTEM] 图片静态服务已启用: /images/ -> {IMAGE_DIR} (本地持久化)")
+
+# ---------- 注册路由 ----------
+app.include_router(gemini_cli_router)
+logger.info("[SYSTEM] Gemini CLI 路由已注册: /v1/gemini-cli/*")
+
+app.include_router(gemini_api_router)
+logger.info("[SYSTEM] Gemini API 原生路由已注册: /v1beta/models/*")
+app.include_router(claude_code_router)
+logger.info("[SYSTEM] Claude Code CLI 路由已注册: /v1/claude-code/*")
+app.include_router(claude_api_router)
+logger.info("[SYSTEM] Claude API 原生路由已注册: /v1/messages")
 
 # ---------- 后台任务启动 ----------
 
