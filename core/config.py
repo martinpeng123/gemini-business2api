@@ -50,7 +50,10 @@ class BasicConfig(BaseModel):
     duckmail_api_key: str = Field(default="", description="DuckMail API key")
     duckmail_verify_ssl: bool = Field(default=True, description="DuckMail SSL校验")
     browser_engine: str = Field(default="dp", description="浏览器引擎：uc 或 dp")
-    browser_headless: bool = Field(default=False, description="自动化浏览器无头模式")
+    browser_headless: bool = Field(
+        default_factory=lambda: os.getenv("BROWSER_HEADLESS", "false").lower() in ("true", "1", "yes"),
+        description="自动化浏览器无头模式（Docker 环境推荐 true）"
+    )
     refresh_window_hours: int = Field(default=1, ge=0, le=24, description="过期刷新窗口（小时）")
     register_default_count: int = Field(default=1, ge=1, le=30, description="默认注册数量")
     register_domain: str = Field(default="", description="默认注册域名（推荐）")
