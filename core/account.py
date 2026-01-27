@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import os
+import random
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -20,6 +22,21 @@ if TYPE_CHECKING:
     from core.jwt import JWTManager
 
 logger = logging.getLogger(__name__)
+
+# HTTP错误名称映射
+HTTP_ERROR_NAMES = {
+    400: "参数错误",
+    401: "认证错误",
+    403: "权限错误",
+    429: "限流"
+}
+
+# 配额类型定义
+QUOTA_TYPES = {
+    "text": "对话",
+    "images": "绘图",
+    "videos": "视频"
+}
 
 # 配置文件路径 - 自动检测环境
 if os.path.exists("/data"):
@@ -104,9 +121,111 @@ class AccountManager:
         self.jwt_manager: Optional['JWTManager'] = None  # 延迟初始化
         self.is_available = True
         self.last_error_time = 0.0
-        self.last_429_time = 0.0  # 429错误专属时间戳
+        self.last_cooldown_time = 0.0  # 冷却时间戳（401/403/429错误）
+        self.quota_cooldowns: Dict[str, float] = {}  # 按配额类型的冷却时间戳 {"text": timestamp, "images": timestamp, "videos": timestamp}
         self.error_count = 0
-        self.conversation_count = 0  # 累计对话次数
+        self.conversation_count = 0  # 累计对话次数（用于统计展示）
+        self.session_usage_count = 0  # 本次启动后使用次数（用于均衡轮询）
+
+    def handle_non_http_error(self, error_context: str = "", request_id: str = "") -> None:
+        """
+        统一处理非HTTP错误（网络错误、解析错误等）
+
+        Args:
+            error_context: 错误上下文（如"JWT获取"、"聊天请求"）
+            request_id: 请求ID（用于日志）
+        """
+        req_tag = f"[req_{request_id}] " if request_id else ""
+        self.last_error_time = time.time()
+        self.error_count += 1
+        if self.error_count >= self.account_failure_threshold:
+            self.is_available = False
+            logger.error(
+                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                f"{error_context}连续失败{self.error_count}次，账户已永久禁用"
+            )
+        else:
+            logger.warning(
+                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                f"{error_context}失败({self.error_count}/{self.account_failure_threshold})"
+            )
+
+    def handle_http_error(self, status_code: int, error_detail: str = "", request_id: str = "", quota_type: Optional[str] = None) -> None:
+        """
+        统一处理HTTP错误（参考 business-gemini-2api-main 的 raise_for_account_response）
+
+        Args:
+            status_code: HTTP状态码
+            error_detail: 错误详情
+            request_id: 请求ID（用于日志）
+            quota_type: 配额类型（"text", "images", "videos"），用于429错误按类型冷却
+
+        处理逻辑：
+            - 400: 参数错误，不计入失败（客户端问题）
+            - 429 + quota_type: 按配额类型冷却（对话/绘图/视频独立冷却）
+            - 429 无quota_type: 全局冷却（整个账户不可用）
+            - 401/403: 全局冷却（认证错误）
+            - 其他HTTP错误: 计入error_count，达到阈值后永久禁用
+        """
+        req_tag = f"[req_{request_id}] " if request_id else ""
+
+        # 400参数错误：不计入失败（客户端问题）
+        if status_code == 400:
+            logger.warning(
+                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                f"HTTP 400参数错误（不计入失败次数）{': ' + error_detail[:100] if error_detail else ''}"
+            )
+            return
+
+        # 429限流错误：按配额类型冷却或全局冷却
+        if status_code == 429:
+            if quota_type and quota_type in QUOTA_TYPES:
+                # 按配额类型冷却（不影响账户整体可用性）
+                self.quota_cooldowns[quota_type] = time.time()
+                logger.warning(
+                    f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                    f"{QUOTA_TYPES[quota_type]}配额限流，将在{self.rate_limit_cooldown_seconds}秒后自动恢复"
+                    f"{': ' + error_detail[:100] if error_detail else ''}"
+                )
+            else:
+                # 全局冷却（未指定配额类型）
+                self.last_cooldown_time = time.time()
+                self.is_available = False
+                logger.warning(
+                    f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                    f"遇到429限流，账户将休息{self.rate_limit_cooldown_seconds}秒后自动恢复"
+                    f"{': ' + error_detail[:100] if error_detail else ''}"
+                )
+            return
+
+        # 401/403认证错误：全局冷却
+        if status_code in (401, 403):
+            self.last_cooldown_time = time.time()
+            self.is_available = False
+            error_type = HTTP_ERROR_NAMES.get(status_code, "HTTP错误")
+            logger.warning(
+                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                f"遇到{status_code}{error_type}，账户将休息{self.rate_limit_cooldown_seconds}秒后自动恢复"
+                f"{': ' + error_detail[:100] if error_detail else ''}"
+            )
+            return
+
+        # 其他HTTP错误：计入error_count
+        self.last_error_time = time.time()
+        self.error_count += 1
+        if self.error_count >= self.account_failure_threshold:
+            self.is_available = False
+            logger.error(
+                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                f"HTTP {status_code}错误连续失败{self.error_count}次，账户已永久禁用"
+                f"{': ' + error_detail[:100] if error_detail else ''}"
+            )
+        else:
+            logger.warning(
+                f"[ACCOUNT] [{self.config.account_id}] {req_tag}"
+                f"HTTP {status_code}错误({self.error_count}/{self.account_failure_threshold})"
+                f"{': ' + error_detail[:100] if error_detail else ''}"
+            )
 
     async def get_jwt(self, request_id: str = "") -> str:
         """获取 JWT token (带错误处理)"""
@@ -126,32 +245,27 @@ class AccountManager:
             self.error_count = 0
             return jwt
         except Exception as e:
-            self.last_error_time = time.time()
-            self.error_count += 1
-            # 使用配置的失败阈值
-            if self.error_count >= self.account_failure_threshold:
-                self.is_available = False
-                logger.error(f"[ACCOUNT] [{self.config.account_id}] JWT获取连续失败{self.error_count}次，账户已永久禁用")
+            # 使用统一的错误处理入口
+            if isinstance(e, HTTPException):
+                self.handle_http_error(e.status_code, str(e.detail) if hasattr(e, 'detail') else "", request_id)
             else:
-                # 安全：只记录异常类型，不记录详细信息
-                logger.warning(f"[ACCOUNT] [{self.config.account_id}] JWT获取失败({self.error_count}/{self.account_failure_threshold}): {type(e).__name__}")
+                self.handle_non_http_error("JWT获取", request_id)
             raise
 
     def should_retry(self) -> bool:
-        """检查账户是否可重试（429错误冷却期后自动恢复，普通错误永久禁用）"""
+        """检查账户是否可重试（冷却期后自动恢复，普通错误永久禁用）"""
         if self.is_available:
             return True
 
         current_time = time.time()
 
-        # 检查429冷却期（冷却期后自动恢复）
-        if self.last_429_time > 0:
-            if current_time - self.last_429_time > self.rate_limit_cooldown_seconds:
+        # 检查冷却期（401/403/429错误冷却期后自动恢复）
+        if self.last_cooldown_time > 0:
+            if current_time - self.last_cooldown_time > self.rate_limit_cooldown_seconds:
                 # 冷却期已过，自动恢复账户可用性
                 self.is_available = True
-                self.last_429_time = 0.0
-                self.error_count = 0  # 重置错误计数
-                logger.info(f"[ACCOUNT] [{self.config.account_id}] 429冷却期已过，账户已自动恢复")
+                self.last_cooldown_time = 0.0
+                logger.info(f"[ACCOUNT] [{self.config.account_id}] 冷却期已过，账户已自动恢复")
                 return True
             return False  # 仍在冷却期
 
@@ -169,19 +283,84 @@ class AccountManager:
         """
         current_time = time.time()
 
-        # 优先检查429冷却期（无论账户是否可用）
-        if self.last_429_time > 0:
-            remaining_429 = self.rate_limit_cooldown_seconds - (current_time - self.last_429_time)
-            if remaining_429 > 0:
-                return (int(remaining_429), "429限流")
-            # 429冷却期已过
+        # 优先检查冷却期（无论账户是否可用）
+        if self.last_cooldown_time > 0:
+            remaining = self.rate_limit_cooldown_seconds - (current_time - self.last_cooldown_time)
+            if remaining > 0:
+                return (int(remaining), "限流冷却")
+            # 冷却期已过
 
-        # 如果账户可用且没有429冷却，返回正常状态
+        # 如果账户可用且没有冷却，返回正常状态
         if self.is_available:
             return (0, None)
 
         # 普通错误永久禁用
         return (-1, "错误禁用")
+
+    def get_quota_status(self) -> Dict[str, any]:
+        """
+        获取配额状态（被动检测模式）
+
+        Returns:
+            {
+                "quotas": {
+                    "text": {"available": bool, "remaining_seconds": int},
+                    "images": {"available": bool, "remaining_seconds": int},
+                    "videos": {"available": bool, "remaining_seconds": int}
+                },
+                "limited_count": int,  # 受限配额数量
+                "total_count": int,    # 总配额数量
+                "is_expired": bool     # 账户是否过期/禁用
+            }
+        """
+        # 检查账户是否过期或被禁用
+        is_expired = self.config.is_expired() or self.config.disabled
+        if is_expired:
+            # 账户过期或被禁用，所有配额不可用
+            quotas = {quota_type: {"available": False} for quota_type in QUOTA_TYPES}
+            return {
+                "quotas": quotas,
+                "limited_count": len(QUOTA_TYPES),
+                "total_count": len(QUOTA_TYPES),
+                "is_expired": True
+            }
+
+        current_time = time.time()
+
+        quotas = {}
+        limited_count = 0
+        expired_quotas = []  # 收集已过期的配额类型
+
+        for quota_type in QUOTA_TYPES:
+            if quota_type in self.quota_cooldowns:
+                cooldown_time = self.quota_cooldowns[quota_type]
+                # 检查冷却时间是否已过（使用统一的 rate_limit_cooldown_seconds）
+                elapsed = current_time - cooldown_time
+                if elapsed < self.rate_limit_cooldown_seconds:
+                    remaining = int(self.rate_limit_cooldown_seconds - elapsed)
+                    quotas[quota_type] = {
+                        "available": False,
+                        "remaining_seconds": remaining
+                    }
+                    limited_count += 1
+                else:
+                    # 冷却时间已过，标记为待删除
+                    expired_quotas.append(quota_type)
+                    quotas[quota_type] = {"available": True}
+            else:
+                # 未检测到限流
+                quotas[quota_type] = {"available": True}
+
+        # 统一删除已过期的配额冷却
+        for quota_type in expired_quotas:
+            del self.quota_cooldowns[quota_type]
+
+        return {
+            "quotas": quotas,
+            "limited_count": limited_count,
+            "total_count": len(QUOTA_TYPES),
+            "is_expired": False
+        }
 
 
 class MultiAccountManager:
@@ -191,7 +370,9 @@ class MultiAccountManager:
         self.account_list: List[str] = []  # 账户ID列表 (用于轮询)
         self.current_index = 0
         self._cache_lock = asyncio.Lock()  # 缓存操作专用锁
-        self._index_lock = asyncio.Lock()  # 索引更新专用锁
+        self._counter_lock = threading.Lock()  # 轮询计数器锁
+        self._request_counter = 0  # 请求计数器
+        self._last_account_count = 0  # 可用账户数量
         # 全局会话缓存：{conv_key: {"account_id": str, "session_id": str, "updated_at": float}}
         self.global_session_cache: Dict[str, dict] = {}
         self.cache_max_size = 1000  # 最大缓存条目数
@@ -289,10 +470,10 @@ class MultiAccountManager:
         logger.info(f"[MULTI] [ACCOUNT] 添加账户: {config.account_id}")
 
     async def get_account(self, account_id: Optional[str] = None, request_id: str = "") -> AccountManager:
-        """获取账户 (智能选择或指定) - 优先选择健康账户，提升响应速度"""
+        """获取账户 - Round-Robin轮询"""
         req_tag = f"[req_{request_id}] " if request_id else ""
 
-        # 如果指定了账户ID（无需锁）
+        # 指定账户ID时直接返回
         if account_id:
             if account_id not in self.accounts:
                 raise HTTPException(404, f"Account {account_id} not found")
@@ -301,39 +482,31 @@ class MultiAccountManager:
                 raise HTTPException(503, f"Account {account_id} temporarily unavailable")
             return account
 
-        # 智能选择可用账户（优先健康账户，提升响应速度）
-        available_accounts = []
-        for acc_id in self.account_list:
-            account = self.accounts[acc_id]
-            # 检查账户是否可用（会自动恢复429冷却期后的账户）
-            if (account.should_retry() and
-                not account.config.is_expired() and
-                not account.config.disabled):
-                # 计算账户健康度（error_count越低越健康）
-                health_score = -account.error_count  # 负数，越大越健康
-                available_accounts.append((acc_id, health_score))
+        # 筛选可用账户
+        available_accounts = [
+            acc for acc in self.accounts.values()
+            if (acc.should_retry() and
+                not acc.config.is_expired() and
+                not acc.config.disabled)
+        ]
 
         if not available_accounts:
             raise HTTPException(503, "No available accounts")
 
-        # 按健康度排序（优先选择error_count最低的账户）
-        available_accounts.sort(key=lambda x: x[1], reverse=True)
+        # 轮询选择
+        with self._counter_lock:
+            if len(available_accounts) != self._last_account_count:
+                self._request_counter = random.randint(0, 999999)
+                self._last_account_count = len(available_accounts)
+            index = self._request_counter % len(available_accounts)
+            self._request_counter += 1
 
-        # 只在更新索引时加锁（最小化锁持有时间）
-        async with self._index_lock:
-            if not hasattr(self, '_available_index'):
-                self._available_index = 0
+        selected = available_accounts[index]
+        selected.session_usage_count += 1
 
-            # 在健康账户中轮询（只在前50%健康账户中选择）
-            healthy_count = max(1, len(available_accounts) // 2)
-            healthy_accounts = [acc_id for acc_id, _ in available_accounts[:healthy_count]]
-
-            account_id = healthy_accounts[self._available_index % len(healthy_accounts)]
-            self._available_index = (self._available_index + 1) % len(healthy_accounts)
-
-        account = self.accounts[account_id]
-        logger.info(f"[MULTI] [ACCOUNT] {req_tag}选择账户: {account_id} (健康度: {account.error_count}错误)")
-        return account
+        logger.info(f"[MULTI] [ACCOUNT] {req_tag}选择账户: {selected.config.account_id} "
+                    f"(索引: {index}/{len(available_accounts)}, 使用: {selected.session_usage_count})")
+        return selected
 
 
 # ---------- 配置文件管理 ----------
@@ -407,11 +580,18 @@ def load_accounts_from_source() -> list:
             logger.warning(f"[CONFIG] 账户配置为空，请在管理面板添加账户或编辑 {ACCOUNTS_FILE}")
         return accounts_data
 
-    # 4. 无配置，创建空配置
-    logger.warning(f"[CONFIG] 未找到配置，已创建空配置")
-    logger.info(f"[CONFIG] 💡 请在管理面板添加账户，或设置 DATABASE_URL 使用数据库存储")
-    save_accounts_to_file([])
-    return []
+    # 4. 无配置处理
+    if storage.is_database_enabled():
+        # 数据库模式：不自动创建空配置，避免覆盖数据库
+        logger.error(f"[CONFIG] 数据库模式下未找到配置，请检查数据库连接或在管理面板添加账户")
+        logger.error(f"[CONFIG] ⚠️ 为防止数据覆盖，不会自动创建空配置")
+        return []
+    else:
+        # 文件模式：创建空配置文件
+        logger.warning(f"[CONFIG] 未找到配置，已创建空配置")
+        logger.info(f"[CONFIG] 💡 请在管理面板添加账户，或设置 DATABASE_URL 使用数据库存储")
+        save_accounts_to_file([])
+        return []
 
 
 def get_account_id(acc: dict, index: int) -> str:
@@ -480,15 +660,11 @@ def reload_accounts(
     session_cache_ttl_seconds: int,
     global_stats: dict
 ) -> MultiAccountManager:
-    """重新加载账户配置（保留现有账户的运行时状态）"""
-    # 保存现有账户的运行时状态
-    old_states = {}
+    """重新加载账户配置（重置所有错误状态，仅保留统计数据）"""
+    # 仅保存统计数据（conversation_count）
+    old_stats = {}
     for account_id, account_mgr in multi_account_mgr.accounts.items():
-        old_states[account_id] = {
-            "is_available": account_mgr.is_available,
-            "last_error_time": account_mgr.last_error_time,
-            "last_429_time": account_mgr.last_429_time,
-            "error_count": account_mgr.error_count,
+        old_stats[account_id] = {
             "conversation_count": account_mgr.conversation_count
         }
 
@@ -503,18 +679,20 @@ def reload_accounts(
         global_stats
     )
 
-    # 恢复现有账户的运行时状态
-    for account_id, state in old_states.items():
+    # 仅恢复统计数据，错误状态全部重置
+    for account_id, stats in old_stats.items():
         if account_id in new_mgr.accounts:
             account_mgr = new_mgr.accounts[account_id]
-            account_mgr.is_available = state["is_available"]
-            account_mgr.last_error_time = state["last_error_time"]
-            account_mgr.last_429_time = state["last_429_time"]
-            account_mgr.error_count = state["error_count"]
-            account_mgr.conversation_count = state["conversation_count"]
-            logger.debug(f"[CONFIG] 账户 {account_id} 运行时状态已恢复")
+            account_mgr.conversation_count = stats["conversation_count"]
+            # 确保错误状态已重置（虽然load_multi_account_config已经初始化，但显式确认）
+            account_mgr.is_available = True
+            account_mgr.last_error_time = 0.0
+            account_mgr.last_cooldown_time = 0.0
+            account_mgr.error_count = 0
+            account_mgr.session_usage_count = 0
+            logger.debug(f"[CONFIG] 账户 {account_id} 已刷新，错误状态已重置")
 
-    logger.info(f"[CONFIG] 配置已重载，当前账户数: {len(new_mgr.accounts)}")
+    logger.info(f"[CONFIG] 配置已重载，当前账户数: {len(new_mgr.accounts)}，所有错误状态已重置")
     return new_mgr
 
 
@@ -606,3 +784,39 @@ def update_account_disabled_status(
     status_text = "已禁用" if disabled else "已启用"
     logger.info(f"[CONFIG] 账户 {account_id} {status_text}")
     return multi_account_mgr
+
+
+def bulk_update_account_disabled_status(
+    account_ids: list[str],
+    disabled: bool,
+    multi_account_mgr: MultiAccountManager,
+) -> tuple[int, list[str]]:
+    """批量更新账户禁用状态，单次最多50个，仅读写一次文件"""
+    success_count = 0
+    errors = []
+
+    # 1. 更新内存状态
+    for account_id in account_ids:
+        if account_id not in multi_account_mgr.accounts:
+            errors.append(f"{account_id}: 账户不存在")
+            continue
+        account_mgr = multi_account_mgr.accounts[account_id]
+        account_mgr.config.disabled = disabled
+        success_count += 1
+
+    # 2. 只读取一次文件
+    accounts_data = load_accounts_from_source()
+    account_id_set = set(account_ids)
+
+    # 3. 批量更新
+    for i, acc in enumerate(accounts_data, 1):
+        acc_id = get_account_id(acc, i)
+        if acc_id in account_id_set:
+            acc["disabled"] = disabled
+
+    # 4. 只保存一次
+    save_accounts_to_file(accounts_data)
+
+    status_text = "已禁用" if disabled else "已启用"
+    logger.info(f"[CONFIG] 批量{status_text} {success_count}/{len(account_ids)} 个账户")
+    return success_count, errors

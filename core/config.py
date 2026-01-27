@@ -45,17 +45,22 @@ class BasicConfig(BaseModel):
     """基础配置"""
     api_key: str = Field(default="", description="API访问密钥（留空则公开访问）")
     base_url: str = Field(default="", description="服务器URL（留空则自动检测）")
-    proxy: str = Field(default="", description="代理地址")
+    proxy_for_auth: str = Field(default="", description="账户操作代理地址（注册/登录/刷新，留空则不使用代理）")
+    proxy_for_chat: str = Field(default="", description="对话操作代理地址（JWT/会话/消息，留空则不使用代理）")
     duckmail_base_url: str = Field(default="https://api.duckmail.sbs", description="DuckMail API地址")
     duckmail_api_key: str = Field(default="", description="DuckMail API key")
     duckmail_verify_ssl: bool = Field(default=True, description="DuckMail SSL校验")
+    temp_mail_provider: str = Field(default="duckmail", description="临时邮箱提供商: duckmail/moemail")
+    moemail_base_url: str = Field(default="https://moemail.app", description="Moemail API地址")
+    moemail_api_key: str = Field(default="", description="Moemail API key")
+    moemail_domain: str = Field(default="", description="Moemail 邮箱域名（可选，留空则随机选择）")
     browser_engine: str = Field(default="dp", description="浏览器引擎：uc 或 dp")
     browser_headless: bool = Field(
         default_factory=lambda: os.getenv("BROWSER_HEADLESS", "false").lower() in ("true", "1", "yes"),
         description="自动化浏览器无头模式（Docker 环境推荐 true）"
     )
     refresh_window_hours: int = Field(default=1, ge=0, le=24, description="过期刷新窗口（小时）")
-    register_default_count: int = Field(default=1, ge=1, le=30, description="默认注册数量")
+    register_default_count: int = Field(default=1, ge=1, description="默认注册数量")
     register_domain: str = Field(default="", description="默认注册域名（推荐）")
     claude_optimize_system_prompt: bool = Field(
         default=True,
@@ -73,14 +78,26 @@ class ImageGenerationConfig(BaseModel):
     output_format: str = Field(default="base64", description="图片输出格式：base64 或 url")
 
 
+class VideoGenerationConfig(BaseModel):
+    """视频生成配置"""
+    output_format: str = Field(default="html", description="视频输出格式：html/url/markdown")
+
+    @validator("output_format")
+    def validate_output_format(cls, v):
+        allowed = ["html", "url", "markdown"]
+        if v not in allowed:
+            raise ValueError(f"output_format 必须是 {allowed} 之一")
+        return v
+
+
 class RetryConfig(BaseModel):
     """重试策略配置"""
     max_new_session_tries: int = Field(default=5, ge=1, le=20, description="新会话尝试账户数")
     max_request_retries: int = Field(default=3, ge=1, le=10, description="请求失败重试次数")
     max_account_switch_tries: int = Field(default=5, ge=1, le=20, description="账户切换尝试次数")
     account_failure_threshold: int = Field(default=3, ge=1, le=10, description="账户失败阈值")
-    rate_limit_cooldown_seconds: int = Field(default=600, ge=60, le=3600, description="429冷却时间（秒）")
-    session_cache_ttl_seconds: int = Field(default=3600, ge=300, le=86400, description="会话缓存时间（秒）")
+    rate_limit_cooldown_seconds: int = Field(default=3600, ge=3600, le=43200, description="429冷却时间（秒）")
+    session_cache_ttl_seconds: int = Field(default=3600, ge=0, le=86400, description="会话缓存时间（秒，0表示禁用缓存）")
     auto_refresh_accounts_seconds: int = Field(default=60, ge=0, le=600, description="自动刷新账号间隔（秒，0禁用）")
 
 
@@ -109,6 +126,7 @@ class AppConfig(BaseModel):
     # 业务配置（环境变量 > YAML > 默认值）
     basic: BasicConfig
     image_generation: ImageGenerationConfig
+    video_generation: VideoGenerationConfig = Field(default_factory=VideoGenerationConfig)
     retry: RetryConfig
     public_display: PublicDisplayConfig
     session: SessionConfig
@@ -154,15 +172,46 @@ class ConfigManager:
         register_domain_raw = basic_data.get("register_domain", "")
         duckmail_api_key_raw = basic_data.get("duckmail_api_key", "")
 
+        # 兼容旧配置：如果存在旧的 proxy 字段，迁移到新字段
+        old_proxy = basic_data.get("proxy", "")
+        old_proxy_for_auth_bool = basic_data.get("proxy_for_auth")
+        old_proxy_for_chat_bool = basic_data.get("proxy_for_chat")
+
+        # 新配置优先，如果没有新配置则从旧配置迁移
+        proxy_for_auth = basic_data.get("proxy_for_auth", "")
+        proxy_for_chat = basic_data.get("proxy_for_chat", "")
+
+        # 优化迁移逻辑：当两个新配置都为空且存在旧 proxy 时，自动迁移旧值
+        if not proxy_for_auth and not proxy_for_chat and old_proxy:
+            proxy_for_auth = old_proxy
+            proxy_for_chat = old_proxy
+        else:
+            # 保留原有逻辑：仅当新配置为空且存在对应布尔标志时才迁移
+            if not proxy_for_auth and old_proxy:
+                if isinstance(old_proxy_for_auth_bool, bool) and old_proxy_for_auth_bool:
+                    proxy_for_auth = old_proxy
+            if not proxy_for_chat and old_proxy:
+                if isinstance(old_proxy_for_chat_bool, bool) and old_proxy_for_chat_bool:
+                    proxy_for_chat = old_proxy
+
+        # 优先使用环境变量，如果环境变量未设置则使用 YAML 值，最后才用默认 False
+        browser_headless_env = os.getenv("BROWSER_HEADLESS", "").lower() in ("true", "1", "yes")
+        browser_headless_value = browser_headless_env if os.getenv("BROWSER_HEADLESS") else basic_data.get("browser_headless", False)
+
         basic_config = BasicConfig(
             api_key=basic_data.get("api_key") or "",
             base_url=basic_data.get("base_url") or "",
-            proxy=basic_data.get("proxy") or "",
+            proxy_for_auth=str(proxy_for_auth or "").strip(),
+            proxy_for_chat=str(proxy_for_chat or "").strip(),
             duckmail_base_url=basic_data.get("duckmail_base_url") or "https://api.duckmail.sbs",
             duckmail_api_key=str(duckmail_api_key_raw or "").strip(),
             duckmail_verify_ssl=_parse_bool(basic_data.get("duckmail_verify_ssl"), True),
+            temp_mail_provider=basic_data.get("temp_mail_provider") or "duckmail",
+            moemail_base_url=basic_data.get("moemail_base_url") or "https://moemail.app",
+            moemail_api_key=str(basic_data.get("moemail_api_key") or "").strip(),
+            moemail_domain=str(basic_data.get("moemail_domain") or "").strip(),
             browser_engine=basic_data.get("browser_engine") or "dp",
-            browser_headless=_parse_bool(basic_data.get("browser_headless"), False),
+            browser_headless=browser_headless_value,
             refresh_window_hours=int(refresh_window_raw),
             register_default_count=int(register_default_raw),
             register_domain=str(register_domain_raw or "").strip(),
@@ -173,9 +222,19 @@ class ConfigManager:
             **yaml_data.get("image_generation", {})
         )
 
-        retry_config = RetryConfig(
-            **yaml_data.get("retry", {})
+        # 加载视频生成配置
+        video_generation_config = VideoGenerationConfig(
+            **yaml_data.get("video_generation", {})
         )
+
+        # 加载重试配置，自动修正不在 1-12 小时范围内的值
+        retry_data = yaml_data.get("retry", {})
+        if "rate_limit_cooldown_seconds" in retry_data:
+            value = retry_data["rate_limit_cooldown_seconds"]
+            if value < 3600 or value > 43200:  # 不在 1-12 小时范围，默认 1 小时
+                retry_data["rate_limit_cooldown_seconds"] = 3600
+
+        retry_config = RetryConfig(**retry_data)
 
         public_display_config = PublicDisplayConfig(
             **yaml_data.get("public_display", {})
@@ -190,6 +249,7 @@ class ConfigManager:
             security=security_config,
             basic=basic_config,
             image_generation=image_generation_config,
+            video_generation=video_generation_config,
             retry=retry_config,
             public_display=public_display_config,
             session=session_config
@@ -256,9 +316,14 @@ class ConfigManager:
         return self._config.security.session_secret_key
 
     @property
-    def proxy(self) -> str:
-        """代理地址"""
-        return self._config.basic.proxy
+    def proxy_for_auth(self) -> str:
+        """账户操作代理地址"""
+        return self._config.basic.proxy_for_auth
+
+    @property
+    def proxy_for_chat(self) -> str:
+        """对话操作代理地址"""
+        return self._config.basic.proxy_for_chat
 
     @property
     def base_url(self) -> str:
@@ -289,6 +354,11 @@ class ConfigManager:
     def image_output_format(self) -> str:
         """图片输出格式"""
         return self._config.image_generation.output_format
+
+    @property
+    def video_output_format(self) -> str:
+        """视频输出格式"""
+        return self._config.video_generation.output_format
 
     @property
     def session_expire_hours(self) -> int:
@@ -355,6 +425,10 @@ class _ConfigProxy:
     @property
     def image_generation(self):
         return config_manager.config.image_generation
+
+    @property
+    def video_generation(self):
+        return config_manager.config.video_generation
 
     @property
     def retry(self):

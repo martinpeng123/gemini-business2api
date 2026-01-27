@@ -3,6 +3,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Union, Dict, Any
 from pathlib import Path
 import logging
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
 import httpx
@@ -33,9 +34,11 @@ ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.yaml")
 STATS_FILE = os.path.join(DATA_DIR, "stats.json")
 IMAGE_DIR = os.path.join(DATA_DIR, "images")
+VIDEO_DIR = os.path.join(DATA_DIR, "videos")
 
-# 确保图片目录存在
+# 确保图片和视频目录存在
 os.makedirs(IMAGE_DIR, exist_ok=True)
+os.makedirs(VIDEO_DIR, exist_ok=True)
 
 # 导入认证模块
 from core.auth import verify_api_key
@@ -64,7 +67,8 @@ from core.account import (
     reload_accounts as _reload_accounts,
     update_accounts_config as _update_accounts_config,
     delete_account as _delete_account,
-    update_account_disabled_status as _update_account_disabled_status
+    update_account_disabled_status as _update_account_disabled_status,
+    bulk_update_account_disabled_status as _bulk_update_account_disabled_status
 )
 
 # 导入 Uptime 追踪器
@@ -79,6 +83,11 @@ from core import storage
 # 导入 Gemini CLI 路由
 from routers import gemini_cli_router, gemini_api_router, claude_code_router, claude_api_router
 
+# 模型到配额类型的映射
+MODEL_TO_QUOTA_TYPE = {
+    "gemini-imagen": "images",
+    "gemini-veo": "videos"
+}
 # ---------- 日志配置 ----------
 
 # 内存日志缓冲区 (保留最近 1000 条日志，重启后清空)
@@ -90,44 +99,68 @@ stats_lock = asyncio.Lock()  # 改为异步锁
 
 async def load_stats():
     """加载统计数据（异步）。"""
+    data = None
     if storage.is_database_enabled():
         try:
             data = await asyncio.to_thread(storage.load_stats_sync)
-            if isinstance(data, dict):
-                return data
+            if not isinstance(data, dict):
+                data = None
         except Exception as e:
             logger.error(f"[STATS] 数据库加载失败: {str(e)[:50]}")
-    try:
-        if os.path.exists(STATS_FILE):
-            async with aiofiles.open(STATS_FILE, 'r', encoding='utf-8') as f:
-                content = await f.read()
-                return json.loads(content)
-    except Exception:
-        pass
-    return {
-        "total_visitors": 0,
-        "total_requests": 0,
-        "request_timestamps": [],
-        "model_request_timestamps": {},
-        "failure_timestamps": [],
-        "rate_limit_timestamps": [],
-        "visitor_ips": {},
-        "account_conversations": {},
-        "recent_conversations": []
-    }
+    if data is None:
+        try:
+            if os.path.exists(STATS_FILE):
+                async with aiofiles.open(STATS_FILE, 'r', encoding='utf-8') as f:
+                    content = await f.read()
+                    data = json.loads(content)
+        except Exception:
+            pass
+
+    # 如果没有加载到数据，返回默认值
+    if data is None:
+        data = {
+            "total_visitors": 0,
+            "total_requests": 0,
+            "request_timestamps": [],
+            "model_request_timestamps": {},
+            "failure_timestamps": [],
+            "rate_limit_timestamps": [],
+            "visitor_ips": {},
+            "account_conversations": {},
+            "recent_conversations": []
+        }
+
+    # 将列表转换为 deque（限制大小防止内存无限增长）
+    if isinstance(data.get("request_timestamps"), list):
+        data["request_timestamps"] = deque(data["request_timestamps"], maxlen=20000)
+    if isinstance(data.get("failure_timestamps"), list):
+        data["failure_timestamps"] = deque(data["failure_timestamps"], maxlen=10000)
+    if isinstance(data.get("rate_limit_timestamps"), list):
+        data["rate_limit_timestamps"] = deque(data["rate_limit_timestamps"], maxlen=10000)
+
+    return data
 
 async def save_stats(stats):
     """保存统计数据（异步，避免阻塞事件循环）"""
+    # 将 deque 转换为 list 以便 JSON 序列化
+    stats_to_save = stats.copy()
+    if isinstance(stats_to_save.get("request_timestamps"), deque):
+        stats_to_save["request_timestamps"] = list(stats_to_save["request_timestamps"])
+    if isinstance(stats_to_save.get("failure_timestamps"), deque):
+        stats_to_save["failure_timestamps"] = list(stats_to_save["failure_timestamps"])
+    if isinstance(stats_to_save.get("rate_limit_timestamps"), deque):
+        stats_to_save["rate_limit_timestamps"] = list(stats_to_save["rate_limit_timestamps"])
+
     if storage.is_database_enabled():
         try:
-            saved = await asyncio.to_thread(storage.save_stats_sync, stats)
+            saved = await asyncio.to_thread(storage.save_stats_sync, stats_to_save)
             if saved:
                 return
         except Exception as e:
             logger.error(f"[STATS] 数据库保存失败: {str(e)[:50]}")
     try:
         async with aiofiles.open(STATS_FILE, 'w', encoding='utf-8') as f:
-            await f.write(json.dumps(stats, ensure_ascii=False, indent=2))
+            await f.write(json.dumps(stats_to_save, ensure_ascii=False, indent=2))
     except Exception as e:
         logger.error(f"[STATS] 保存统计数据失败: {str(e)[:50]}")
 
@@ -135,10 +168,10 @@ async def save_stats(stats):
 global_stats = {
     "total_visitors": 0,
     "total_requests": 0,
-    "request_timestamps": [],
+    "request_timestamps": deque(maxlen=20000),
     "model_request_timestamps": {},
-    "failure_timestamps": [],
-    "rate_limit_timestamps": [],
+    "failure_timestamps": deque(maxlen=10000),
+    "rate_limit_timestamps": deque(maxlen=10000),
     "visitor_ips": {},
     "account_conversations": {},
     "recent_conversations": []
@@ -237,6 +270,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("gemini")
 
+# ---------- Linux zombie process reaper ----------
+# DrissionPage / Chromium may spawn subprocesses that exit without being waited on,
+# which can accumulate as zombies (<defunct>) in long-running services.
+try:
+    from core.child_reaper import install_child_reaper
+
+    install_child_reaper(log=lambda m: logger.warning(m))
+except Exception:
+    # Never fail startup due to optional process reaper.
+    pass
+
 # 添加内存日志处理器
 memory_handler = MemoryLogHandler()
 memory_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S"))
@@ -247,7 +291,8 @@ logger.addHandler(memory_handler)
 TIMEOUT_SECONDS = 600
 API_KEY = config.basic.api_key
 ADMIN_KEY = config.security.admin_key
-PROXY = config.basic.proxy
+PROXY_FOR_AUTH = config.basic.proxy_for_auth
+PROXY_FOR_CHAT = config.basic.proxy_for_chat
 BASE_URL = config.basic.base_url
 SESSION_SECRET_KEY = config.security.session_secret_key
 SESSION_EXPIRE_HOURS = config.session.expire_hours
@@ -259,6 +304,30 @@ CHAT_URL = config.public_display.chat_url
 # ---------- 图片生成配置 ----------
 IMAGE_GENERATION_ENABLED = config.image_generation.enabled
 IMAGE_GENERATION_MODELS = config.image_generation.supported_models
+
+# ---------- 虚拟模型映射 ----------
+VIRTUAL_MODELS = {
+    "gemini-imagen": {"imageGenerationSpec": {}},
+    "gemini-veo": {"videoGenerationSpec": {}},
+}
+
+def get_tools_spec(model_name: str) -> dict:
+    """根据模型名称返回工具配置"""
+    # 虚拟模型
+    if model_name in VIRTUAL_MODELS:
+        return VIRTUAL_MODELS[model_name]
+
+    # 普通模型
+    tools_spec = {
+        "webGroundingSpec": {},
+        "toolRegistry": "default_tool_registry",
+    }
+
+    if IMAGE_GENERATION_ENABLED and model_name in IMAGE_GENERATION_MODELS:
+        tools_spec["imageGenerationSpec"] = {}
+
+    return tools_spec
+
 
 # ---------- 重试配置 ----------
 MAX_NEW_SESSION_TRIES = config.retry.max_new_session_tries
@@ -279,16 +348,45 @@ MODEL_MAPPING = {
 }
 
 # ---------- HTTP 客户端 ----------
+# 对话操作客户端（用于JWT获取、创建会话、发送消息）
 http_client = httpx.AsyncClient(
-    proxy=PROXY or None,
+    proxy=(PROXY_FOR_CHAT or None),
     verify=False,
     http2=False,
     timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
     limits=httpx.Limits(
-        max_keepalive_connections=100,  # 增加5倍：20 -> 100
-        max_connections=200              # 增加4倍：50 -> 200
+        max_keepalive_connections=100,
+        max_connections=200
     )
 )
+
+# 对话流式客户端（用于流式响应）
+http_client_chat = httpx.AsyncClient(
+    proxy=(PROXY_FOR_CHAT or None),
+    verify=False,
+    http2=False,
+    timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
+    limits=httpx.Limits(
+        max_keepalive_connections=100,
+        max_connections=200
+    )
+)
+
+# 账户操作客户端（用于注册/登录/刷新）
+http_client_auth = httpx.AsyncClient(
+    proxy=(PROXY_FOR_AUTH or None),
+    verify=False,
+    http2=False,
+    timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
+    limits=httpx.Limits(
+        max_keepalive_connections=100,
+        max_connections=200
+    )
+)
+
+# 打印代理配置日志
+logger.info(f"[PROXY] Account operations (register/login/refresh): {PROXY_FOR_AUTH if PROXY_FOR_AUTH else 'disabled'}")
+logger.info(f"[PROXY] Chat operations (JWT/session/messages): {PROXY_FOR_CHAT if PROXY_FOR_CHAT else 'disabled'}")
 
 # ---------- 工具函数 ----------
 def get_base_url(request: Request) -> str:
@@ -344,7 +442,7 @@ try:
     from core.login_service import LoginService
     register_service = RegisterService(
         multi_account_mgr,
-        http_client,
+        http_client_auth,
         USER_AGENT,
         ACCOUNT_FAILURE_THRESHOLD,
         RATE_LIMIT_COOLDOWN_SECONDS,
@@ -354,7 +452,7 @@ try:
     )
     login_service = LoginService(
         multi_account_mgr,
-        http_client,
+        http_client_auth,
         USER_AGENT,
         ACCOUNT_FAILURE_THRESHOLD,
         RATE_LIMIT_COOLDOWN_SECONDS,
@@ -389,8 +487,96 @@ logger.info("[SYSTEM] 系统初始化完成")
 # ---------- 消息处理逻辑 ----------
 # (消息处理函数已移至 core/message.py)
 
+# ---------- 媒体处理函数 ----------
+def process_image(data: bytes, mime: str, chat_id: str, file_id: str, base_url: str, idx: int, request_id: str, account_id: str) -> str:
+    """处理图片：根据配置返回 base64 或 URL"""
+    output_format = config_manager.image_output_format
+
+    if output_format == "base64":
+        b64 = base64.b64encode(data).decode()
+        logger.info(f"[IMAGE] [{account_id}] [req_{request_id}] 图片{idx}已编码为base64")
+        return f"\n\n![生成的图片](data:{mime};base64,{b64})\n\n"
+    else:
+        url = save_image_to_hf(data, chat_id, file_id, mime, base_url, IMAGE_DIR)
+        logger.info(f"[IMAGE] [{account_id}] [req_{request_id}] 图片{idx}已保存: {url}")
+        return f"\n\n![生成的图片]({url})\n\n"
+
+def process_video(data: bytes, mime: str, chat_id: str, file_id: str, base_url: str, idx: int, request_id: str, account_id: str) -> str:
+    """处理视频：根据配置返回不同格式"""
+    url = save_image_to_hf(data, chat_id, file_id, mime, base_url, VIDEO_DIR, "videos")
+    logger.info(f"[VIDEO] [{account_id}] [req_{request_id}] 视频{idx}已保存: {url}")
+
+    output_format = config_manager.video_output_format
+
+    if output_format == "html":
+        return f'\n\n<video controls width="100%" style="max-width: 640px;"><source src="{url}" type="{mime}">您的浏览器不支持视频播放</video>\n\n'
+    elif output_format == "markdown":
+        return f"\n\n![生成的视频]({url})\n\n"
+    else:  # url
+        return f"\n\n{url}\n\n"
+
+def process_media(data: bytes, mime: str, chat_id: str, file_id: str, base_url: str, idx: int, request_id: str, account_id: str) -> str:
+    """统一媒体处理入口：根据 MIME 类型分发到对应处理器"""
+    logger.info(f"[MEDIA] [{account_id}] [req_{request_id}] 处理媒体{idx}: MIME={mime}")
+    if mime.startswith("video/"):
+        return process_video(data, mime, chat_id, file_id, base_url, idx, request_id, account_id)
+    else:
+        return process_image(data, mime, chat_id, file_id, base_url, idx, request_id, account_id)
+
+# ---------- 应用生命周期管理 ----------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    global global_stats
+
+    # 文件迁移逻辑：将根目录的旧文件迁移到 data 目录
+    old_accounts = "accounts.json"
+    if os.path.exists(old_accounts) and not os.path.exists(ACCOUNTS_FILE):
+        try:
+            shutil.copy(old_accounts, ACCOUNTS_FILE)
+            logger.info(f"{logger_prefix} 已迁移 {old_accounts} -> {ACCOUNTS_FILE}")
+        except Exception as e:
+            logger.warning(f"{logger_prefix} 文件迁移失败: {e}")
+
+    # 加载统计数据
+    global_stats = await load_stats()
+    global_stats.setdefault("request_timestamps", [])
+    global_stats.setdefault("model_request_timestamps", {})
+    global_stats.setdefault("failure_timestamps", [])
+    global_stats.setdefault("rate_limit_timestamps", [])
+    global_stats.setdefault("recent_conversations", [])
+    uptime_tracker.configure_storage(os.path.join(DATA_DIR, "uptime.json"))
+    uptime_tracker.load_heartbeats()
+    logger.info(f"[SYSTEM] 统计数据已加载: {global_stats['total_requests']} 次请求, {global_stats['total_visitors']} 位访客")
+
+    # 启动缓存清理任务
+    asyncio.create_task(multi_account_mgr.start_background_cleanup())
+    logger.info("[SYSTEM] 后台缓存清理任务已启动（间隔: 5分钟）")
+
+    # 启动自动刷新账号任务（仅数据库模式有效）
+    if os.environ.get("ACCOUNTS_CONFIG"):
+        logger.info("[SYSTEM] 自动刷新账号已跳过（使用 ACCOUNTS_CONFIG）")
+    elif storage.is_database_enabled() and AUTO_REFRESH_ACCOUNTS_SECONDS > 0:
+        asyncio.create_task(auto_refresh_accounts_task())
+        logger.info(f"[SYSTEM] 自动刷新账号任务已启动（间隔: {AUTO_REFRESH_ACCOUNTS_SECONDS}秒）")
+    elif storage.is_database_enabled():
+        logger.info("[SYSTEM] 自动刷新账号功能已禁用（配置为0）")
+
+    # 启动自动登录刷新轮询
+    if login_service:
+        try:
+            asyncio.create_task(login_service.start_polling())
+            logger.info("[SYSTEM] 账户过期检查轮询已启动（间隔: 30分钟）")
+        except Exception as e:
+            logger.error(f"[SYSTEM] 启动登录服务失败: {e}")
+    else:
+        logger.info("[SYSTEM] 自动登录刷新未启用或依赖不可用")
+
+    yield
+
+
 # ---------- OpenAI 兼容接口 ----------
-app = FastAPI(title="Gemini-Business OpenAI Gateway")
+app = FastAPI(title="Gemini-Business OpenAI Gateway", lifespan=lifespan)
 
 frontend_origin = os.getenv("FRONTEND_ORIGIN", "").strip()
 allow_all_origins = os.getenv("ALLOW_ALL_ORIGINS", "0") == "1"
@@ -473,13 +659,17 @@ async def track_uptime_middleware(request: Request, call_next):
         raise
 
 
-# ---------- 图片静态服务初始化 ----------
+# ---------- 图片和视频静态服务初始化 ----------
 os.makedirs(IMAGE_DIR, exist_ok=True)
+os.makedirs(VIDEO_DIR, exist_ok=True)
 app.mount("/images", StaticFiles(directory=IMAGE_DIR), name="images")
+app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="videos")
 if IMAGE_DIR == "/data/images":
     logger.info(f"[SYSTEM] 图片静态服务已启用: /images/ -> {IMAGE_DIR} (HF Pro持久化)")
+    logger.info(f"[SYSTEM] 视频静态服务已启用: /videos/ -> {VIDEO_DIR} (HF Pro持久化)")
 else:
     logger.info(f"[SYSTEM] 图片静态服务已启用: /images/ -> {IMAGE_DIR} (本地持久化)")
+    logger.info(f"[SYSTEM] 视频静态服务已启用: /videos/ -> {VIDEO_DIR} (本地持久化)")
 
 # ---------- 注册路由 ----------
 app.include_router(gemini_cli_router)
@@ -558,53 +748,7 @@ async def auto_refresh_accounts_task():
             await asyncio.sleep(60)  # 出错后等待60秒再重试
 
 
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时初始化后台任务"""
-    global global_stats
 
-    # 文件迁移逻辑：将根目录的旧文件迁移到 data 目录
-    old_accounts = "accounts.json"
-    if os.path.exists(old_accounts) and not os.path.exists(ACCOUNTS_FILE):
-        try:
-            shutil.copy(old_accounts, ACCOUNTS_FILE)
-            logger.info(f"{logger_prefix} 已迁移 {old_accounts} -> {ACCOUNTS_FILE}")
-        except Exception as e:
-            logger.warning(f"{logger_prefix} 文件迁移失败: {e}")
-
-    # 加载统计数据
-    global_stats = await load_stats()
-    global_stats.setdefault("request_timestamps", [])
-    global_stats.setdefault("model_request_timestamps", {})
-    global_stats.setdefault("failure_timestamps", [])
-    global_stats.setdefault("rate_limit_timestamps", [])
-    global_stats.setdefault("recent_conversations", [])
-    uptime_tracker.configure_storage(os.path.join(DATA_DIR, "uptime.json"))
-    uptime_tracker.load_heartbeats()
-    logger.info(f"[SYSTEM] 统计数据已加载: {global_stats['total_requests']} 次请求, {global_stats['total_visitors']} 位访客")
-
-    # 启动缓存清理任务
-    asyncio.create_task(multi_account_mgr.start_background_cleanup())
-    logger.info("[SYSTEM] 后台缓存清理任务已启动（间隔: 5分钟）")
-
-    # 启动自动刷新账号任务（仅数据库模式有效）
-    if os.environ.get("ACCOUNTS_CONFIG"):
-        logger.info("[SYSTEM] 自动刷新账号已跳过（使用 ACCOUNTS_CONFIG）")
-    elif storage.is_database_enabled() and AUTO_REFRESH_ACCOUNTS_SECONDS > 0:
-        asyncio.create_task(auto_refresh_accounts_task())
-        logger.info(f"[SYSTEM] 自动刷新账号任务已启动（间隔: {AUTO_REFRESH_ACCOUNTS_SECONDS}秒）")
-    elif storage.is_database_enabled():
-        logger.info("[SYSTEM] 自动刷新账号功能已禁用（配置为0）")
-
-    # 启动自动登录刷新轮询
-    if login_service:
-        try:
-            asyncio.create_task(login_service.start_polling())
-            logger.info("[SYSTEM] 账户过期检查轮询已启动（间隔: 30分钟）")
-        except Exception as e:
-            logger.error(f"[SYSTEM] 启动登录服务失败: {e}")
-    else:
-        logger.info("[SYSTEM] 自动登录刷新未启用或依赖不可用")
 
 # ---------- 日志脱敏函数 ----------
 def get_sanitized_logs(limit: int = 100) -> list:
@@ -906,22 +1050,21 @@ async def admin_stats(request: Request):
         return buckets
 
     async with stats_lock:
-        global_stats.setdefault("request_timestamps", [])
-        global_stats.setdefault("failure_timestamps", [])
-        global_stats.setdefault("rate_limit_timestamps", [])
+        global_stats.setdefault("request_timestamps", deque(maxlen=20000))
+        global_stats.setdefault("failure_timestamps", deque(maxlen=10000))
+        global_stats.setdefault("rate_limit_timestamps", deque(maxlen=10000))
         global_stats.setdefault("model_request_timestamps", {})
-        global_stats["request_timestamps"] = [
-            ts for ts in global_stats["request_timestamps"]
-            if now - ts < window_seconds
-        ]
-        global_stats["failure_timestamps"] = [
-            ts for ts in global_stats["failure_timestamps"]
-            if now - ts < window_seconds
-        ]
-        global_stats["rate_limit_timestamps"] = [
-            ts for ts in global_stats["rate_limit_timestamps"]
-            if now - ts < window_seconds
-        ]
+
+        # 清理过期数据，保持 deque 类型
+        cleaned_request_ts = [ts for ts in global_stats["request_timestamps"] if now - ts < window_seconds]
+        global_stats["request_timestamps"] = deque(cleaned_request_ts, maxlen=20000)
+
+        cleaned_failure_ts = [ts for ts in global_stats["failure_timestamps"] if now - ts < window_seconds]
+        global_stats["failure_timestamps"] = deque(cleaned_failure_ts, maxlen=10000)
+
+        cleaned_rate_limit_ts = [ts for ts in global_stats["rate_limit_timestamps"] if now - ts < window_seconds]
+        global_stats["rate_limit_timestamps"] = deque(cleaned_rate_limit_ts, maxlen=10000)
+
         model_request_timestamps = {}
         for model, timestamps in global_stats["model_request_timestamps"].items():
             model_request_timestamps[model] = [
@@ -968,6 +1111,7 @@ async def admin_get_accounts(request: Request):
         remaining_hours = config.get_remaining_hours()
         status, status_color, remaining_display = format_account_expiration(remaining_hours)
         cooldown_seconds, cooldown_reason = account_manager.get_cooldown_info()
+        quota_status = account_manager.get_quota_status()
 
         accounts_info.append({
             "id": config.account_id,
@@ -980,7 +1124,9 @@ async def admin_get_accounts(request: Request):
             "disabled": config.disabled,
             "cooldown_seconds": cooldown_seconds,
             "cooldown_reason": cooldown_reason,
-            "conversation_count": account_manager.conversation_count
+            "conversation_count": account_manager.conversation_count,
+            "session_usage_count": account_manager.session_usage_count,
+            "quota_status": quota_status  # 新增配额状态
         })
 
     return {"total": len(accounts_info), "accounts": accounts_info}
@@ -1020,6 +1166,19 @@ async def admin_start_register(request: Request, count: Optional[int] = Body(def
     task = await register_service.start_register(count=count, domain=domain)
     return task.to_dict()
 
+
+@app.post("/admin/register/cancel/{task_id}")
+@require_login()
+async def admin_cancel_register_task(request: Request, task_id: str, payload: dict = Body(default=None)):
+    if not register_service:
+        raise HTTPException(503, "register service unavailable")
+    payload = payload or {}
+    reason = payload.get("reason") or "cancelled"
+    task = await register_service.cancel_task(task_id, reason=reason)
+    if not task:
+        raise HTTPException(404, "task not found")
+    return task.to_dict()
+
 @app.get("/admin/register/task/{task_id}")
 @require_login()
 async def admin_get_register_task(request: Request, task_id: str):
@@ -1048,6 +1207,19 @@ async def admin_start_login(request: Request, account_ids: List[str] = Body(...)
     task = await login_service.start_login(account_ids)
     return task.to_dict()
 
+
+@app.post("/admin/login/cancel/{task_id}")
+@require_login()
+async def admin_cancel_login_task(request: Request, task_id: str, payload: dict = Body(default=None)):
+    if not login_service:
+        raise HTTPException(503, "login service unavailable")
+    payload = payload or {}
+    reason = payload.get("reason") or "cancelled"
+    task = await login_service.cancel_task(task_id, reason=reason)
+    if not task:
+        raise HTTPException(404, "task not found")
+    return task.to_dict()
+
 @app.get("/admin/login/task/{task_id}")
 @require_login()
 async def admin_get_login_task(request: Request, task_id: str):
@@ -1073,8 +1245,41 @@ async def admin_get_current_login_task(request: Request):
 async def admin_check_login_refresh(request: Request):
     if not login_service:
         raise HTTPException(503, "login service unavailable")
-    await login_service.check_and_refresh()
-    return {"status": "ok"}
+    task = await login_service.check_and_refresh()
+    if not task:
+        return {"status": "idle"}
+    return task.to_dict()
+
+@app.post("/admin/auto-refresh/pause")
+@require_login()
+async def admin_pause_auto_refresh(request: Request):
+    """暂停自动刷新（运行时开关，不保存到数据库）"""
+    if not login_service:
+        raise HTTPException(503, "login service unavailable")
+    login_service.pause_auto_refresh()
+    return {"status": "paused", "message": "Auto-refresh paused (runtime only)"}
+
+@app.post("/admin/auto-refresh/resume")
+@require_login()
+async def admin_resume_auto_refresh(request: Request):
+    """恢复自动刷新并立即执行一次检查"""
+    if not login_service:
+        raise HTTPException(503, "login service unavailable")
+    was_paused = login_service.resume_auto_refresh()
+    # 如果之前是暂停状态，立即执行一次检查
+    if was_paused:
+        asyncio.create_task(login_service.check_and_refresh())
+        return {"status": "active", "message": "Auto-refresh resumed and checking now"}
+    return {"status": "active", "message": "Auto-refresh resumed"}
+
+@app.get("/admin/auto-refresh/status")
+@require_login()
+async def admin_get_auto_refresh_status(request: Request):
+    """获取自动刷新状态"""
+    if not login_service:
+        raise HTTPException(503, "login service unavailable")
+    is_paused = login_service.is_auto_refresh_paused()
+    return {"paused": is_paused, "status": "paused" if is_paused else "active"}
 
 @app.delete("/admin/accounts/{account_id}")
 @require_login()
@@ -1125,13 +1330,42 @@ async def admin_enable_account(request: Request, account_id: str):
             account_mgr = multi_account_mgr.accounts[account_id]
             account_mgr.is_available = True
             account_mgr.error_count = 0
-            account_mgr.last_429_time = 0.0
+            account_mgr.last_cooldown_time = 0.0
+            account_mgr.quota_cooldowns = {}
             logger.info(f"[CONFIG] 账户 {account_id} 错误状态已重置")
 
         return {"status": "success", "message": f"账户 {account_id} 已启用", "account_count": len(multi_account_mgr.accounts)}
     except Exception as e:
         logger.error(f"[CONFIG] 启用账户失败: {str(e)}")
         raise HTTPException(500, f"启用失败: {str(e)}")
+
+@app.put("/admin/accounts/bulk-enable")
+@require_login()
+async def admin_bulk_enable_accounts(request: Request, account_ids: list[str]):
+    """批量启用账户，单次最多50个"""
+    global multi_account_mgr
+    success_count, errors = _bulk_update_account_disabled_status(
+        account_ids, False, multi_account_mgr
+    )
+    # 重置运行时错误状态
+    for account_id in account_ids:
+        if account_id in multi_account_mgr.accounts:
+            account_mgr = multi_account_mgr.accounts[account_id]
+            account_mgr.is_available = True
+            account_mgr.error_count = 0
+            account_mgr.last_cooldown_time = 0.0
+            account_mgr.quota_cooldowns = {}
+    return {"status": "success", "success_count": success_count, "errors": errors}
+
+@app.put("/admin/accounts/bulk-disable")
+@require_login()
+async def admin_bulk_disable_accounts(request: Request, account_ids: list[str]):
+    """批量禁用账户，单次最多50个"""
+    global multi_account_mgr
+    success_count, errors = _bulk_update_account_disabled_status(
+        account_ids, True, multi_account_mgr
+    )
+    return {"status": "success", "success_count": success_count, "errors": errors}
 
 # ---------- Auth endpoints (API) ----------
 @app.get("/admin/settings")
@@ -1143,10 +1377,15 @@ async def admin_get_settings(request: Request):
         "basic": {
             "api_key": config.basic.api_key,
             "base_url": config.basic.base_url,
-            "proxy": config.basic.proxy,
+            "proxy_for_auth": config.basic.proxy_for_auth,
+            "proxy_for_chat": config.basic.proxy_for_chat,
             "duckmail_base_url": config.basic.duckmail_base_url,
             "duckmail_api_key": config.basic.duckmail_api_key,
             "duckmail_verify_ssl": config.basic.duckmail_verify_ssl,
+            "temp_mail_provider": config.basic.temp_mail_provider,
+            "moemail_base_url": config.basic.moemail_base_url,
+            "moemail_api_key": config.basic.moemail_api_key,
+            "moemail_domain": config.basic.moemail_domain,
             "browser_engine": config.basic.browser_engine,
             "browser_headless": config.basic.browser_headless,
             "refresh_window_hours": config.basic.refresh_window_hours,
@@ -1157,6 +1396,9 @@ async def admin_get_settings(request: Request):
             "enabled": config.image_generation.enabled,
             "supported_models": config.image_generation.supported_models,
             "output_format": config.image_generation.output_format
+        },
+        "video_generation": {
+            "output_format": config.video_generation.output_format
         },
         "retry": {
             "max_new_session_tries": config.retry.max_new_session_tries,
@@ -1180,17 +1422,21 @@ async def admin_get_settings(request: Request):
 @require_login()
 async def admin_update_settings(request: Request, new_settings: dict = Body(...)):
     """更新系统设置"""
-    global API_KEY, PROXY, BASE_URL, LOGO_URL, CHAT_URL
+    global API_KEY, PROXY_FOR_AUTH, PROXY_FOR_CHAT, BASE_URL, LOGO_URL, CHAT_URL
     global IMAGE_GENERATION_ENABLED, IMAGE_GENERATION_MODELS
     global MAX_NEW_SESSION_TRIES, MAX_REQUEST_RETRIES, MAX_ACCOUNT_SWITCH_TRIES
     global ACCOUNT_FAILURE_THRESHOLD, RATE_LIMIT_COOLDOWN_SECONDS, SESSION_CACHE_TTL_SECONDS, AUTO_REFRESH_ACCOUNTS_SECONDS
-    global SESSION_EXPIRE_HOURS, multi_account_mgr, http_client
+    global SESSION_EXPIRE_HOURS, multi_account_mgr, http_client, http_client_chat, http_client_auth
 
     try:
         basic = dict(new_settings.get("basic") or {})
         basic.setdefault("duckmail_base_url", config.basic.duckmail_base_url)
         basic.setdefault("duckmail_api_key", config.basic.duckmail_api_key)
         basic.setdefault("duckmail_verify_ssl", config.basic.duckmail_verify_ssl)
+        basic.setdefault("temp_mail_provider", config.basic.temp_mail_provider)
+        basic.setdefault("moemail_base_url", config.basic.moemail_base_url)
+        basic.setdefault("moemail_api_key", config.basic.moemail_api_key)
+        basic.setdefault("moemail_domain", config.basic.moemail_domain)
         basic.setdefault("browser_engine", config.basic.browser_engine)
         basic.setdefault("browser_headless", config.basic.browser_headless)
         basic.setdefault("refresh_window_hours", config.basic.refresh_window_hours)
@@ -1208,12 +1454,20 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         image_generation["output_format"] = output_format
         new_settings["image_generation"] = image_generation
 
+        video_generation = dict(new_settings.get("video_generation") or {})
+        video_output_format = str(video_generation.get("output_format") or config_manager.video_output_format).lower()
+        if video_output_format not in ("html", "url", "markdown"):
+            video_output_format = "html"
+        video_generation["output_format"] = video_output_format
+        new_settings["video_generation"] = video_generation
+
         retry = dict(new_settings.get("retry") or {})
         retry.setdefault("auto_refresh_accounts_seconds", config.retry.auto_refresh_accounts_seconds)
         new_settings["retry"] = retry
 
         # 保存旧配置用于对比
-        old_proxy = PROXY
+        old_proxy_for_auth = PROXY_FOR_AUTH
+        old_proxy_for_chat = PROXY_FOR_CHAT
         old_retry_config = {
             "account_failure_threshold": ACCOUNT_FAILURE_THRESHOLD,
             "rate_limit_cooldown_seconds": RATE_LIMIT_COOLDOWN_SECONDS,
@@ -1228,7 +1482,8 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
 
         # 更新全局变量（实时生效）
         API_KEY = config.basic.api_key
-        PROXY = config.basic.proxy
+        PROXY_FOR_AUTH = config.basic.proxy_for_auth
+        PROXY_FOR_CHAT = config.basic.proxy_for_chat
         BASE_URL = config.basic.base_url
         LOGO_URL = config.public_display.logo_url
         CHAT_URL = config.public_display.chat_url
@@ -1244,11 +1499,15 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
         SESSION_EXPIRE_HOURS = config.session.expire_hours
 
         # 检查是否需要重建 HTTP 客户端（代理变化）
-        if old_proxy != PROXY:
-            logger.info(f"[CONFIG] 代理配置已变化，重建 HTTP 客户端")
-            await http_client.aclose()  # 关闭旧客户端
+        if old_proxy_for_auth != PROXY_FOR_AUTH or old_proxy_for_chat != PROXY_FOR_CHAT:
+            logger.info(f"[CONFIG] Proxy configuration changed, rebuilding HTTP clients")
+            await http_client.aclose()
+            await http_client_chat.aclose()
+            await http_client_auth.aclose()
+
+            # 重新创建对话客户端
             http_client = httpx.AsyncClient(
-                proxy=PROXY or None,
+                proxy=(PROXY_FOR_CHAT or None),
                 verify=False,
                 http2=False,
                 timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
@@ -1257,8 +1516,43 @@ async def admin_update_settings(request: Request, new_settings: dict = Body(...)
                     max_connections=200
                 )
             )
-            # 更新所有账户的 http_client 引用
+
+            # 重新创建对话流式客户端
+            http_client_chat = httpx.AsyncClient(
+                proxy=(PROXY_FOR_CHAT or None),
+                verify=False,
+                http2=False,
+                timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
+                limits=httpx.Limits(
+                    max_keepalive_connections=100,
+                    max_connections=200
+                )
+            )
+
+            # 重新创建账户操作客户端
+            http_client_auth = httpx.AsyncClient(
+                proxy=(PROXY_FOR_AUTH or None),
+                verify=False,
+                http2=False,
+                timeout=httpx.Timeout(TIMEOUT_SECONDS, connect=60.0),
+                limits=httpx.Limits(
+                    max_keepalive_connections=100,
+                    max_connections=200
+                )
+            )
+
+            # 打印新的代理配置
+            logger.info(f"[PROXY] Account operations (register/login/refresh): {PROXY_FOR_AUTH if PROXY_FOR_AUTH else 'disabled'}")
+            logger.info(f"[PROXY] Chat operations (JWT/session/messages): {PROXY_FOR_CHAT if PROXY_FOR_CHAT else 'disabled'}")
+
+            # 更新所有账户的 http_client 引用（对话用）
             multi_account_mgr.update_http_client(http_client)
+
+            # 更新注册/登录服务的 http_client 引用（账户操作用）
+            if register_service:
+                register_service.http_client = http_client_auth
+            if login_service:
+                login_service.http_client = http_client_auth
 
         # 检查是否需要更新账户管理器配置（重试策略变化）
         retry_changed = (
@@ -1349,6 +1643,8 @@ async def list_models(authorization: str = Header(None)):
     now = int(time.time())
     for m in MODEL_MAPPING.keys():
         data.append({"id": m, "object": "model", "created": now, "owned_by": "google", "permission": []})
+    data.append({"id": "gemini-imagen", "object": "model", "created": now, "owned_by": "google", "permission": []})
+    data.append({"id": "gemini-veo", "object": "model", "created": now, "owned_by": "google", "permission": []})
     return {"object": "list", "data": data}
 
 @app.get("/v1/models/{model_id}")
@@ -1450,12 +1746,14 @@ async def chat_impl(
         await save_stats(global_stats)
 
     # 2. 模型校验
-    if req.model not in MODEL_MAPPING:
+
+    if req.model not in MODEL_MAPPING and req.model not in VIRTUAL_MODELS:
         logger.error(f"[CHAT] [req_{request_id}] 不支持的模型: {req.model}")
+        all_models = list(MODEL_MAPPING.keys()) + list(VIRTUAL_MODELS.keys())
         await finalize_result("error", 404, f"HTTP 404: Model '{req.model}' not found")
         raise HTTPException(
             status_code=404,
-            detail=f"Model '{req.model}' not found. Available models: {list(MODEL_MAPPING.keys())}"
+            detail=f"Model '{req.model}' not found. Available models: {all_models}"
         )
 
     # 保存模型信息到 request.state（用于 Uptime 追踪）
@@ -1480,7 +1778,6 @@ async def chat_impl(
             # 新对话：轮询选择可用账户，失败时尝试其他账户
             max_account_tries = min(MAX_NEW_SESSION_TRIES, len(multi_account_mgr.accounts))
             last_error = None
-            account_manager = None  # 初始化，防止异常时未定义
 
             for attempt in range(max_account_tries):
                 try:
@@ -1641,50 +1938,32 @@ async def chat_impl(
                 break
 
             except (httpx.HTTPError, ssl.SSLError, HTTPException) as e:
-                status_code = e.status_code if isinstance(e, HTTPException) else None
+                # 提取错误信息
+                is_http_exception = isinstance(e, HTTPException)
+                status_code = e.status_code if is_http_exception else None
                 error_detail = (
                     f"HTTP {e.status_code}: {e.detail}"
-                    if isinstance(e, HTTPException)
+                    if is_http_exception
                     else f"{type(e).__name__}: {str(e)[:200]}"
                 )
+
                 # 记录当前失败的账户
                 failed_accounts.add(account_manager.config.account_id)
 
                 # 记录账号池状态（请求失败）
-                status_code = e.status_code if isinstance(e, HTTPException) else None
-
                 uptime_tracker.record_request("account_pool", False, status_code=status_code)
 
-                # 检查是否为429错误（Rate Limit）
-                is_rate_limit = isinstance(e, HTTPException) and e.status_code == 429
+                # 判断请求类型以传递quota_type（使用字典映射）
+                quota_type = MODEL_TO_QUOTA_TYPE.get(req.model)
+                # 普通对话模型返回None（text配额是基础配额，所有请求都需要）
 
-                # 429错误单独处理（不增加error_count，只设置冷却时间）
-                if is_rate_limit:
-                    account_manager.last_429_time = time.time()
-                    account_manager.is_available = False  # 临时禁用，冷却期后自动恢复
-                    logger.warning(f"[ACCOUNT] [{account_manager.config.account_id}] [req_{request_id}] 遇到429限流，账户将休息{RATE_LIMIT_COOLDOWN_SECONDS}秒后自动恢复")
+                # 使用统一的错误处理入口
+                if is_http_exception:
+                    account_manager.handle_http_error(status_code, str(e.detail) if hasattr(e, 'detail') else "", request_id, quota_type)
                 else:
-                    # 非429错误才增加失败计数
-                    account_manager.last_error_time = time.time()
-                    account_manager.error_count += 1
-                    if account_manager.error_count >= ACCOUNT_FAILURE_THRESHOLD:
-                        account_manager.is_available = False
-                        logger.error(f"[ACCOUNT] [{account_manager.config.account_id}] [req_{request_id}] 请求连续失败{account_manager.error_count}次，账户已永久禁用")
+                    account_manager.handle_non_http_error("聊天请求", request_id)
 
                 retry_count += 1
-
-                # 详细记录错误信息
-                error_type = type(e).__name__
-                error_detail = str(e)
-
-                # 特殊处理HTTPException，提取状态码和详情
-                if isinstance(e, HTTPException):
-                    if is_rate_limit:
-                        logger.error(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] 遇到429限流错误，账户将休息{RATE_LIMIT_COOLDOWN_SECONDS}秒")
-                    else:
-                        logger.error(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] HTTP错误 {e.status_code}: {e.detail}")
-                else:
-                    logger.error(f"[CHAT] [{account_manager.config.account_id}] [req_{request_id}] {error_type}: {error_detail}")
 
                 # 检查是否还能继续重试
                 if retry_count <= max_retries:
@@ -1812,6 +2091,7 @@ def parse_images_from_response(data_list: list) -> tuple[list, str]:
     """
     file_ids = []
     session_name = ""
+    seen_file_ids = set()  # 用于去重
 
     for data in data_list:
         sar = data.get("streamAssistResponse")
@@ -1833,9 +2113,17 @@ def parse_images_from_response(data_list: list) -> tuple[list, str]:
             # 检查file字段（图片生成的关键）
             file_info = content.get("file")
             if file_info and file_info.get("fileId"):
+                file_id = file_info["fileId"]
+                # 去重：同一个 fileId 只处理一次
+                if file_id in seen_file_ids:
+                    continue
+                seen_file_ids.add(file_id)
+
+                mime_type = file_info.get("mimeType", "image/png")
+                logger.debug(f"[PARSE] 解析文件: fileId={file_id}, mimeType={mime_type}")
                 file_ids.append({
-                    "fileId": file_info["fileId"],
-                    "mimeType": file_info.get("mimeType", "image/png")
+                    "fileId": file_id,
+                    "mimeType": mime_type
                 })
 
     return file_ids, session_name
@@ -1855,15 +2143,8 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
     jwt = await account_manager.get_jwt(request_id)
     headers = get_common_headers(jwt, USER_AGENT)
 
-    # 构建 toolsSpec（根据配置决定是否启用图片生成）
-    tools_spec = {
-        "webGroundingSpec": {},
-        "toolRegistry": "default_tool_registry",
-    }
-    # 只在启用且模型支持时添加图片生成
-    if IMAGE_GENERATION_ENABLED and model_name in IMAGE_GENERATION_MODELS:
-        tools_spec["imageGenerationSpec"] = {}
-        tools_spec["videoGenerationSpec"] = {}
+
+    tools_spec = get_tools_spec(model_name)
 
     body = {
         "configId": account_manager.config.config_id,
@@ -1961,6 +2242,8 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
                 fid = file_info["fileId"]
                 mime = file_info["mimeType"]
                 meta = file_metadata.get(fid, {})
+                # 优先使用 metadata 中的 MIME 类型
+                mime = meta.get("mimeType", mime)
                 correct_session = meta.get("session") or session_name
                 task = download_image_with_jwt(account_manager, correct_session, fid, http_client, USER_AGENT, request_id)
                 download_tasks.append((fid, mime, task))
@@ -1979,26 +2262,13 @@ async def stream_chat_generator(session: str, text_content: str, file_ids: List[
                     continue
 
                 try:
-                    # 根据配置选择输出格式
-                    output_format = config_manager.image_output_format
-
-                    if output_format == "base64":
-                        # Base64 模式：直接返回 base64 编码
-                        b64 = base64.b64encode(result).decode()
-                        markdown = f"\n\n![生成的图片](data:{mime};base64,{b64})\n\n"
-                        logger.info(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 图片{idx}已编码为base64")
-                    else:
-                        # URL 模式：保存到本地并返回 URL
-                        image_url = save_image_to_hf(result, chat_id, fid, mime, base_url, IMAGE_DIR)
-                        markdown = f"\n\n![生成的图片]({image_url})\n\n"
-                        logger.info(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 图片{idx}已保存: {image_url}")
-
+                    markdown = process_media(result, mime, chat_id, fid, base_url, idx, request_id, account_manager.config.account_id)
                     success_count += 1
                     chunk = create_chunk(chat_id, created_time, model_name, {"content": markdown}, None)
                     yield f"data: {chunk}\n\n"
                 except Exception as save_error:
-                    logger.error(f"[IMAGE] [{account_manager.config.account_id}] [req_{request_id}] 图片{idx}处理失败: {str(save_error)[:100]}")
-                    error_msg = f"\n\n⚠️ 图片 {idx} 处理失败\n\n"
+                    logger.error(f"[MEDIA] [{account_manager.config.account_id}] [req_{request_id}] 媒体{idx}处理失败: {str(save_error)[:100]}")
+                    error_msg = f"\n\n⚠️ 媒体 {idx} 处理失败\n\n"
                     chunk = create_chunk(chat_id, created_time, model_name, {"content": error_msg}, None)
                     yield f"data: {chunk}\n\n"
 

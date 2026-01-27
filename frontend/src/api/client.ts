@@ -1,4 +1,6 @@
-﻿import axios, { type AxiosInstance, type AxiosError } from 'axios'
+import axios, { type AxiosInstance, type AxiosError } from 'axios'
+import { useAuthStore } from '@/stores/auth'
+import router from '@/router'
 
 // 创建 axios 实例
 export const apiClient: AxiosInstance = axios.create({
@@ -26,19 +28,24 @@ apiClient.interceptors.response.use(
   async (error: AxiosError) => {
     // 统一错误处理
     if (error.response?.status === 401) {
-      const { useAuthStore } = await import('@/stores/auth')
       const authStore = useAuthStore()
       authStore.isLoggedIn = false
-
-      const router = await import('@/router')
-      router.default.push('/login')
+      router.push('/login')
     }
 
     const errorMessage = error.response?.data
       ? (error.response.data as any).detail || (error.response.data as any).message
       : error.message
 
-    return Promise.reject(new Error(errorMessage || '请求失败'))
+    // 保留 HTTP 状态码，便于调用方做精细化处理（例如任务不存在时的 404）
+    const wrapped = new Error(errorMessage || '请求失败') as Error & {
+      status?: number
+      data?: unknown
+    }
+    wrapped.status = error.response?.status
+    wrapped.data = error.response?.data
+
+    return Promise.reject(wrapped)
   }
 )
 

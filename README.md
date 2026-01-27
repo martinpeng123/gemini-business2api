@@ -9,15 +9,7 @@
 </p>
 <p align="center"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" /> <img src="https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white" /> <img src="https://img.shields.io/badge/FastAPI-0.110-009688?logo=fastapi&logoColor=white" /> <img src="https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white" /> <img src="https://img.shields.io/badge/Vite-7-646CFF?logo=vite&logoColor=white" /> <img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" /></p>
 
-<p align="center">
-  <a href="https://huggingface.co/spaces/xiaoyukkkk/gemini-business2api?duplicate=true">
-    <img src="https://huggingface.co/datasets/huggingface/badges/resolve/main/deploy-to-spaces-md.svg" />
-  </a>
-</p>
-
-<p align="center"><em>💡 提示：远程环境(Hugging Face/Linux)和本地环境可共用同一数据库，账户数据将自动保持同步</em></p>
-
-<p align="center">将 Gemini Business 转换为 OpenAI 兼容接口，支持多账号负载均衡、图像生成、多模态能力与内置管理面板。</p>
+<p align="center">将 Gemini Business 转换为 OpenAI 兼容接口，支持多账号负载均衡、图像生成、视频生成、多模态能力与内置管理面板。</p>
 
 ---
 
@@ -50,6 +42,7 @@
 - ✅ 流式输出 - 实时响应
 - ✅ 多模态输入 - 100+ 文件类型（图片、PDF、Office 文档、音频、视频、代码等）
 - ✅ 图片生成 & 图生图 - 模型可配置，Base64 或 URL 返回
+- ✅ 视频生成 - 专用模型，支持 HTML/URL/Markdown 输出格式
 - ✅ 智能文件处理 - 自动识别文件类型，支持 URL 与 Base64
 - ✅ 日志与监控 - 实时状态与统计信息
 - ✅ 代理支持 - 通过设置面板配置
@@ -58,17 +51,59 @@
 
 ## 🤖 模型功能
 
-| 模型ID                   | 识图 | 原生联网 | 文件多模态 | 香蕉绘图 |
-| ------------------------ | ---- | -------- | ---------- | -------- |
-| `gemini-auto`            | ✅    | ✅        | ✅          | 可选     |
-| `gemini-2.5-flash`       | ✅    | ✅        | ✅          | 可选     |
-| `gemini-2.5-pro`         | ✅    | ✅        | ✅          | 可选     |
-| `gemini-3-flash-preview` | ✅    | ✅        | ✅          | 可选     |
-| `gemini-3-pro-preview`   | ✅    | ✅        | ✅          | 可选     |
+| 模型ID                   | 识图 | 原生联网 | 文件多模态 | 图片生成 | 视频生成 |
+| ------------------------ | ---- | -------- | ---------- | -------- | -------- |
+| `gemini-auto`            | ✅    | ✅        | ✅          | 可选     | -        |
+| `gemini-2.5-flash`       | ✅    | ✅        | ✅          | 可选     | -        |
+| `gemini-2.5-pro`         | ✅    | ✅        | ✅          | 可选     | -        |
+| `gemini-3-flash-preview` | ✅    | ✅        | ✅          | 可选     | -        |
+| `gemini-3-pro-preview`   | ✅    | ✅        | ✅          | 可选     | -        |
+| `gemini-imagen`          | ✅    | ✅        | ✅          | ✅        | -        |
+| `gemini-veo`             | ✅    | ✅        | ✅          | -        | ✅        |
+
+**虚拟模型说明**：
+- `gemini-imagen`：专用图片生成模型，强制启用图片生成功能
+- `gemini-veo`：专用视频生成模型，强制启用视频生成功能
 
 ## 🚀 快速开始
 
-### 前置要求
+### 方式一：Zeabur 部署（推荐，支持自动更新）
+
+大佬对Linux和Docker的部署优化 [感谢PR](https://github.com/Dreamy-rain/gemini-business2api/pull/37)
+
+#### 第一步：Fork 仓库
+
+点击本页面右上角的 **Fork** 按钮，将项目复制到你的 GitHub 账号。
+
+#### 第二步：部署到 Zeabur
+
+1. 登录 [Zeabur](https://zeabur.com) 并创建新项目
+2. 点击 **创建项目** → **共享集群 / Silicon Valley, United States（腾讯云）** → **创建项目** → **部署新服务** → **连接Github（没有授权一路授权即可）** → **选择你刚刚 Fork 的仓库** → **部署即可**
+3. 点击服务卡片 → **变量** 标签，添加环境变量：
+
+| 变量名         | 必填 | 说明                                          |
+| -------------- | ---- | --------------------------------------------- |
+| `ADMIN_KEY`    | ✅    | 管理面板登录密钥，自己设置一个                |
+| `DATABASE_URL` | 推荐 | PostgreSQL 连接串（见下方"数据库持久化"说明） |
+
+> 💡 **强烈建议配置 DATABASE_URL**，否则 Zeabur 重启后数据会丢失。免费数据库获取：[neon.tech](https://neon.tech)
+
+4. 点击 **重新部署** 使环境变量生效
+5. 等待构建完成（约 1-2 分钟）
+
+#### 如何更新？
+
+当本项目有更新时：
+
+1. 打开你 Fork 的 GitHub 仓库页面
+2. 点击 **Sync fork** → **Update branch**
+3. Zeabur 会自动检测变更并重新部署，无需手动操作
+
+---
+
+### 方式二：使用安装脚本（本地部署）
+
+#### 前置要求
 
 - **Python 3.11**（必需，项目使用 uv 自动管理 Python 版本）
 - **Git**
@@ -126,7 +161,7 @@ pm2 start main.py --name gemini-api --interpreter ./.venv/Scripts/python.exe
 
 **更新项目：** 直接运行相同命令即可，脚本会自动更新所有组件（代码、依赖、前端、Python 环境）
 
-### 方式二：手动部署
+### 方式三：手动部署
 
 ```bash
 git clone https://github.com/Dreamy-rain/gemini-business2api.git
@@ -161,7 +196,7 @@ python main.py
 pm2 start main.py --name gemini-api --interpreter ./.venv/bin/python3
 ```
 
-### 方式三：Docker Compose（推荐用于生产环境）
+### 方式四：Docker Compose（推荐用于生产环境）
 
 **支持 ARM64 和 AMD64 架构**
 
@@ -183,8 +218,6 @@ docker-compose logs -f
 # 5. 更新到最新版本
 docker-compose pull && docker-compose up -d
 ```
-
-感谢 [PR #9](https://github.com/Dreamy-rain/gemini-business2api/pull/9) 优化 Dockerfile 构建
 
 
 ### 数据库持久化（可选）（强烈推荐）

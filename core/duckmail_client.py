@@ -41,9 +41,9 @@ class DuckMailClient:
         if self.api_key and "Authorization" not in headers:
             headers["Authorization"] = f"Bearer {self.api_key}"
         kwargs["headers"] = headers
-        self._log("info", f"[HTTP] {method} {url}")
+        self._log("info", f"📤 发送 {method} 请求: {url}")
         if "json" in kwargs:
-            self._log("info", f"[HTTP] Request body: {kwargs['json']}")
+            self._log("info", f"📦 请求体: {kwargs['json']}")
 
         try:
             res = requests.request(
@@ -54,33 +54,36 @@ class DuckMailClient:
                 timeout=kwargs.pop("timeout", 15),
                 **kwargs,
             )
-            self._log("info", f"[HTTP] Response: {res.status_code}")
+            self._log("info", f"📥 收到响应: HTTP {res.status_code}")
             log_body = os.getenv("DUCKMAIL_LOG_BODY", "").strip().lower() in ("1", "true", "yes", "y", "on")
             if res.content and (log_body or res.status_code >= 400):
                 try:
-                    self._log("info", f"[HTTP] Response body: {res.text[:500]}")
+                    self._log("info", f"📄 响应内容: {res.text[:500]}")
                 except Exception:
                     pass
             return res
         except Exception as e:
-            self._log("error", f"[HTTP] Request failed: {e}")
+            self._log("error", f"❌ 网络请求失败: {e}")
             raise
 
     def register_account(self, domain: Optional[str] = None) -> bool:
         """注册新邮箱账号"""
         # 获取域名
         if not domain:
+            self._log("info", "🔍 正在获取可用域名...")
             domain = self._get_domain()
-        self._log("info", f"DuckMail domain: {domain}")
+        self._log("info", f"📧 使用域名: {domain}")
 
         # 生成随机邮箱和密码
         rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
         timestamp = str(int(time.time()))[-4:]
         self.email = f"t{timestamp}{rand}@{domain}"
         self.password = f"Pwd{rand}{timestamp}"
-        self._log("info", f"DuckMail register email: {self.email}")
+        self._log("info", f"🎲 生成邮箱: {self.email}")
+        self._log("info", f"🔑 生成密码: {self.password}")
 
         try:
+            self._log("info", "📤 正在向 DuckMail 发送注册请求...")
             res = self._request(
                 "POST",
                 f"{self.base_url}/accounts",
@@ -89,21 +92,25 @@ class DuckMailClient:
             if res.status_code in (200, 201):
                 data = res.json() if res.content else {}
                 self.account_id = data.get("id")
-                self._log("info", "DuckMail register success")
+                self._log("info", f"✅ DuckMail 注册成功，账户ID: {self.account_id}")
                 return True
+            else:
+                self._log("error", f"❌ DuckMail 注册失败: HTTP {res.status_code}")
         except Exception as e:
-            self._log("error", f"DuckMail register failed: {e}")
+            self._log("error", f"❌ DuckMail 注册异常: {e}")
             return False
 
-        self._log("error", "DuckMail register failed")
+        self._log("error", "❌ DuckMail 注册失败")
         return False
 
     def login(self) -> bool:
         """登录获取token"""
         if not self.email or not self.password:
+            self._log("error", "❌ 邮箱或密码未设置")
             return False
 
         try:
+            self._log("info", f"🔐 正在登录 DuckMail: {self.email}")
             res = self._request(
                 "POST",
                 f"{self.base_url}/token",
@@ -114,23 +121,29 @@ class DuckMailClient:
                 token = data.get("token")
                 if token:
                     self.token = token
-                    self._log("info", f"DuckMail login success, token: {token[:20]}...")
+                    self._log("info", f"✅ DuckMail 登录成功，Token: {token[:20]}...")
                     return True
+                else:
+                    self._log("error", "❌ 响应中未找到 Token")
+            else:
+                self._log("error", f"❌ DuckMail 登录失败: HTTP {res.status_code}")
         except Exception as e:
-            self._log("error", f"DuckMail login failed: {e}")
+            self._log("error", f"❌ DuckMail 登录异常: {e}")
             return False
 
-        self._log("error", "DuckMail login failed")
+        self._log("error", "❌ DuckMail 登录失败")
         return False
 
     def fetch_verification_code(self, since_time=None) -> Optional[str]:
         """获取验证码"""
         if not self.token:
+            self._log("info", "🔐 Token 不存在，尝试重新登录...")
             if not self.login():
+                self._log("error", "❌ 登录失败，无法获取验证码")
                 return None
 
         try:
-            self._log("info", "fetching verification code")
+            self._log("info", "📬 正在拉取邮件列表...")
             # 获取邮件列表
             res = self._request(
                 "GET",
@@ -139,16 +152,20 @@ class DuckMailClient:
             )
 
             if res.status_code != 200:
+                self._log("error", f"❌ 获取邮件列表失败: HTTP {res.status_code}")
                 return None
 
             data = res.json() if res.content else {}
             messages = data.get("hydra:member", [])
 
             if not messages:
+                self._log("info", "📭 邮箱为空，暂无邮件")
                 return None
 
+            self._log("info", f"📨 收到 {len(messages)} 封邮件，开始检查验证码...")
+
             # 遍历邮件，过滤时间
-            for msg in messages:
+            for idx, msg in enumerate(messages, 1):
                 msg_id = msg.get("id")
                 if not msg_id:
                     continue
@@ -164,8 +181,10 @@ class DuckMailClient:
                         # 转换 UTC 时间到本地时区
                         msg_time = datetime.fromisoformat(created_at.replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
                         if msg_time < since_time:
+                            self._log("info", f"⏭️ 邮件 {idx} 时间过早，跳过")
                             continue
 
+                self._log("info", f"🔍 正在读取邮件 {idx}/{len(messages)} (ID: {msg_id[:10]}...)")
                 detail = self._request(
                     "GET",
                     f"{self.base_url}/messages/{msg_id}",
@@ -173,6 +192,7 @@ class DuckMailClient:
                 )
 
                 if detail.status_code != 200:
+                    self._log("warning", f"⚠️ 读取邮件详情失败: HTTP {detail.status_code}")
                     continue
 
                 payload = detail.json() if detail.content else {}
@@ -187,15 +207,20 @@ class DuckMailClient:
                     text_content = "".join(str(item) for item in text_content)
 
                 content = text_content + html_content
+                self._log("info", f"📄 邮件内容预览: {content[:200]}...")
+
                 code = extract_verification_code(content)
                 if code:
-                    self._log("info", f"code found: {code}")
+                    self._log("info", f"✅ 找到验证码: {code}")
                     return code
+                else:
+                    self._log("info", f"❌ 邮件 {idx} 中未找到验证码")
 
+            self._log("warning", "⚠️ 所有邮件中均未找到验证码")
             return None
 
         except Exception as e:
-            self._log("error", f"fetch code failed: {e}")
+            self._log("error", f"❌ 获取验证码异常: {e}")
             return None
 
     def poll_for_code(
@@ -206,20 +231,26 @@ class DuckMailClient:
     ) -> Optional[str]:
         """轮询获取验证码"""
         if not self.token:
+            self._log("info", "🔐 Token 不存在，尝试登录...")
             if not self.login():
+                self._log("error", "❌ 登录失败，无法轮询验证码")
                 return None
 
         max_retries = timeout // interval
+        self._log("info", f"⏱️ 开始轮询验证码 (超时 {timeout}秒, 间隔 {interval}秒, 最多 {max_retries} 次)")
 
         for i in range(1, max_retries + 1):
+            self._log("info", f"🔄 第 {i}/{max_retries} 次轮询...")
             code = self.fetch_verification_code(since_time=since_time)
             if code:
+                self._log("info", f"🎉 验证码获取成功: {code}")
                 return code
 
             if i < max_retries:
+                self._log("info", f"⏳ 等待 {interval} 秒后重试...")
                 time.sleep(interval)
 
-        self._log("error", "verification code timeout")
+        self._log("error", f"⏰ 验证码获取超时 ({timeout}秒)")
         return None
 
     def _get_domain(self) -> str:

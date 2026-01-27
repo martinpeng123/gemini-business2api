@@ -1,5 +1,21 @@
 // API 类型定义
 
+export interface QuotaStatus {
+  available: boolean
+  remaining_seconds?: number
+}
+
+export interface AccountQuotaStatus {
+  quotas: {
+    text: QuotaStatus
+    images: QuotaStatus
+    videos: QuotaStatus
+  }
+  limited_count: number
+  total_count: number
+  is_expired: boolean
+}
+
 export interface AdminAccount {
   id: string
   status: string
@@ -12,6 +28,7 @@ export interface AdminAccount {
   cooldown_seconds: number
   cooldown_reason: string | null
   conversation_count: number
+  quota_status: AccountQuotaStatus
 }
 
 export interface AccountsListResponse {
@@ -20,7 +37,7 @@ export interface AccountsListResponse {
 }
 
 export interface AccountConfigItem {
-  id?: string
+  id: string
   secure_c_ses: string
   csesidx: string
   config_id: string
@@ -53,10 +70,15 @@ export interface Settings {
   basic: {
     api_key?: string
     base_url?: string
-    proxy?: string
+    proxy_for_auth?: string
+    proxy_for_chat?: string
     duckmail_base_url?: string
     duckmail_api_key?: string
     duckmail_verify_ssl?: boolean
+    temp_mail_provider?: string
+    moemail_base_url?: string
+    moemail_api_key?: string
+    moemail_domain?: string
     browser_engine?: string
     browser_headless?: boolean
     refresh_window_hours?: number
@@ -204,11 +226,12 @@ export interface LoginResponse {
   message?: string
 }
 
-export type AutomationStatus = 'pending' | 'running' | 'success' | 'failed'
+export type AutomationStatus = 'pending' | 'running' | 'success' | 'failed' | 'cancelled'
 
 export interface RegisterTask {
   id: string
   count: number
+  domain?: string | null
   status: AutomationStatus
   progress: number
   success_count: number
@@ -218,6 +241,8 @@ export interface RegisterTask {
   results: Array<Record<string, any>>
   error?: string | null
   logs?: Array<{ time: string; level: string; message: string }>
+  cancel_requested?: boolean
+  cancel_reason?: string | null
 }
 
 export interface LoginTask {
@@ -232,4 +257,6 @@ export interface LoginTask {
   results: Array<Record<string, any>>
   error?: string | null
   logs?: Array<{ time: string; level: string; message: string }>
+  cancel_requested?: boolean
+  cancel_reason?: string | null
 }

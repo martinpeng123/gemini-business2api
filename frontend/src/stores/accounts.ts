@@ -25,31 +25,40 @@ export const useAccountsStore = defineStore('accounts', () => {
   }
 
   async function disableAccount(accountId: string) {
+    await accountsApi.disable(accountId)
     const account = accounts.value.find(acc => acc.id === accountId)
     if (account) account.disabled = true
-    await accountsApi.disable(accountId)
   }
 
   async function enableAccount(accountId: string) {
-    const account = accounts.value.find(acc => acc.id === accountId)
-    if (account) account.disabled = false
     await accountsApi.enable(accountId)
+    const account = accounts.value.find(acc => acc.id === accountId)
+    if (account) {
+      account.disabled = false
+      // 清除冷却状态，因为启用操作也会重置这些
+      account.cooldown_seconds = 0
+      account.cooldown_reason = ''
+    }
   }
 
   async function bulkEnable(accountIds: string[]) {
+    await accountsApi.bulkEnable(accountIds)
     accountIds.forEach(id => {
       const account = accounts.value.find(acc => acc.id === id)
-      if (account) account.disabled = false
+      if (account) {
+        account.disabled = false
+        account.cooldown_seconds = 0
+        account.cooldown_reason = ''
+      }
     })
-    await Promise.all(accountIds.map(accountId => accountsApi.enable(accountId)))
   }
 
   async function bulkDisable(accountIds: string[]) {
+    await accountsApi.bulkDisable(accountIds)
     accountIds.forEach(id => {
       const account = accounts.value.find(acc => acc.id === id)
       if (account) account.disabled = true
     })
-    await Promise.all(accountIds.map(accountId => accountsApi.disable(accountId)))
   }
 
   async function bulkDelete(accountIds: string[]) {
