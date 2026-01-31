@@ -1258,6 +1258,7 @@ const loginLogClearMarker = ref<TaskLogLine | null>(null)
 const registerAgreed = ref(false)
 const registerTask = ref<RegisterTask | null>(null)
 const loginTask = ref<LoginTask | null>(null)
+const refreshingAccounts = ref<Set<string>>(new Set())  // 正在刷新的账户ID集合
 const taskLogsRef = ref<HTMLDivElement | null>(null)
 const isRegistering = ref(false)
 const isRefreshing = ref(false)
@@ -2268,6 +2269,10 @@ onBeforeUnmount(() => {
 })
 
 const statusLabel = (account: AdminAccount) => {
+  // 检查是否正在刷新
+  if (refreshingAccounts.value.has(account.id)) {
+    return '刷新中'
+  }
   if (account.cooldown_reason?.includes('429') && account.cooldown_seconds > 0) {
     return '429限流'
   }
@@ -2285,6 +2290,9 @@ const statusLabel = (account: AdminAccount) => {
 
 const statusClass = (account: AdminAccount) => {
   const status = statusLabel(account)
+  if (status === '刷新中') {
+    return 'bg-sky-500 text-white'
+  }
   if (status === '429限流' || status === '即将过期') {
     return 'bg-amber-200 text-amber-900'
   }
@@ -2800,14 +2808,18 @@ const updateLoginTask = async (taskId: string) => {
     if (error?.status === 404 || error?.message === 'Not found') {
       clearLoginTimer()
       isRefreshing.value = false
+      refreshingAccounts.value = new Set()  // 清空刷新状态
       return
     }
     throw error
   }
   syncLoginTask(task)
+  // 更新正在刷新的账户列表
+  await updateRefreshingAccounts()
   if (task.status !== 'running' && task.status !== 'pending') {
     isRefreshing.value = false
     clearLoginTimer()
+    refreshingAccounts.value = new Set()  // 任务完成，清空刷新状态
     await refreshAccounts()
 
     // 显示任务完成通知
@@ -2871,6 +2883,17 @@ const startBackgroundTaskPolling = () => {
 const loadCurrentTasks = async () => {
   await loadCurrentTaskByKind('register')
   await loadCurrentTaskByKind('login')
+  // 同时更新正在刷新的账户列表
+  await updateRefreshingAccounts()
+}
+
+const updateRefreshingAccounts = async () => {
+  try {
+    const result = await accountsApi.getRefreshingAccounts()
+    refreshingAccounts.value = new Set(result.refreshing_accounts || [])
+  } catch {
+    // 忽略错误，保持现有状态
+  }
 }
 
 const handleRegister = async () => {
