@@ -64,7 +64,7 @@ class BasicConfig(BaseModel):
     gptmail_api_key: str = Field(default="", description="GPTMail API key")
     gptmail_verify_ssl: bool = Field(default=True, description="GPTMail SSL校验")
     gptmail_domain: str = Field(default="", description="GPTMail 邮箱域名（可选，留空则随机选择）")
-    browser_engine: str = Field(default="dp", description="浏览器引擎：uc 或 dp")
+    browser_engine: str = Field(default="dp", description="浏览器引擎")
     browser_headless: bool = Field(default=False, description="自动化浏览器无头模式")
     refresh_window_hours: int = Field(default=1, ge=0, le=24, description="过期刷新窗口（小时）")
     register_default_count: int = Field(default=1, ge=1, description="默认注册数量")

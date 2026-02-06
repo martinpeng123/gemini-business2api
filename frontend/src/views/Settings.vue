@@ -414,8 +414,7 @@ const videosRateLimitCooldownHours = createCooldownHours(
 )
 
 const browserEngineOptions = [
-  { label: 'UC - 支持无头/有头', value: 'uc' },
-  { label: 'DP - 支持无头/有头（推荐）', value: 'dp' },
+  { label: 'DP - 支持无头/有头', value: 'dp' },
 ]
 const tempMailProviderOptions = mailProviderOptions
 const imageOutputOptions = [

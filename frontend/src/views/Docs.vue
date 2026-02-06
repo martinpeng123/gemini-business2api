@@ -290,7 +290,7 @@ INFO:     127.0.0.1:7860 - "GET /admin/login/current HTTP/1.1" 503 Service Unava
 INFO:     127.0.0.1:7860 - "POST /admin/register/start HTTP/1.1" 503 Service Unavailable</pre>
                 <p class="mt-3 font-medium text-foreground">解决方法：</p>
                 <ul class="mt-2 space-y-1 pl-4">
-                  <li>• 这是 undetected-chromedriver 没有正常启动导致的</li>
+                  <li>• 这是浏览器引擎没有正常启动导致的</li>
                   <li>• 在虚拟环境内重新安装依赖：<code class="rounded bg-card px-1.5 py-0.5 font-mono text-[11px]">pip install -r requirements.txt</code></li>
                   <li>• 删除之前的进程（检查是否有残留的 Chrome 进程）</li>
                   <li>• 重新启动服务</li>
