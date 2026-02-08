@@ -139,7 +139,7 @@ class FreemailClient:
 
             self._log("info", f"📨 收到 {len(emails)} 封邮件，开始检查验证码...")
 
-            from datetime import datetime
+            from datetime import datetime, timezone
             import re
 
             def _parse_email_time(email_obj) -> Optional[datetime]:
@@ -184,7 +184,7 @@ class FreemailClient:
                         parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
                         if parsed.tzinfo:
                             return parsed.astimezone().replace(tzinfo=None)
-                        return parsed
+                        return parsed.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
                     except Exception:
                         return None
 
