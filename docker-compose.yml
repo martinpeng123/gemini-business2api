@@ -1,6 +1,6 @@
 services:
   gemini-api:
-    build: .
+    image: cooooookk/gemini-business2api:latest
     container_name: gemini-business2api
     ports:
       - "7860:7860"

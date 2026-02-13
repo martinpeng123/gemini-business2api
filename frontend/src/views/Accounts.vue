@@ -1,5 +1,31 @@
 ﻿<template>
-  <div class="space-y-8">
+  <div class="space-y-8 relative">
+    <!-- 全局加载遮罩 -->
+    <Teleport to="body">
+      <div
+        v-if="isOperating"
+        class="fixed inset-0 z-[200] flex items-center justify-center bg-background/80 backdrop-blur-sm"
+      >
+        <div class="flex flex-col items-center gap-4 rounded-2xl border border-border bg-card p-8 shadow-lg">
+          <svg class="h-10 w-10 animate-spin text-primary" viewBox="0 0 24 24" fill="none">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+          </svg>
+          <div class="flex flex-col items-center gap-2">
+            <p class="text-sm font-medium text-foreground">
+              {{ batchProgress ? `处理中 ${batchProgress.current}/${batchProgress.total}` : '操作处理中...' }}
+            </p>
+            <div v-if="batchProgress" class="w-48 h-1.5 bg-muted rounded-full overflow-hidden">
+              <div
+                class="h-full bg-primary transition-all duration-300"
+                :style="{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }"
+              ></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
     <section class="rounded-3xl border border-border bg-card p-6">
       <div class="flex flex-wrap items-center justify-between gap-4">
         <div class="grid w-full grid-cols-2 gap-3 sm:flex sm:w-auto sm:items-center">
@@ -68,12 +94,31 @@
         <button
           class="rounded-full border border-border px-4 py-2 text-sm font-medium text-foreground transition-colors
                  hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
-          :disabled="isRegistering"
+          :disabled="isRegistering || isRefreshing"
           @click="openRegisterModal"
         >
           添加账户
         </button>
-        
+
+        <button
+          class="relative rounded-full border border-border px-4 py-2 text-sm font-medium transition-colors
+                 hover:border-primary hover:text-primary"
+          @click="openTaskModal"
+        >
+          <span class="flex items-center gap-2">
+            任务管理
+            <template v-if="isTaskRunning">
+              <span class="flex items-center gap-1.5 text-xs text-sky-500">
+                <span class="relative flex h-2 w-2">
+                  <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-500 opacity-75"></span>
+                  <span class="relative inline-flex h-2 w-2 rounded-full bg-sky-500"></span>
+                </span>
+                {{ taskProgressText }}
+              </span>
+            </template>
+          </span>
+        </button>
+
         <div ref="moreActionsRef" class="relative">
           <button
             class="flex items-center gap-2 rounded-full border border-input bg-background px-4 py-2 text-sm font-medium
@@ -85,12 +130,6 @@
             <svg aria-hidden="true" viewBox="0 0 20 20" class="h-4 w-4" fill="currentColor">
               <path d="M5 7l5 6 5-6H5z" />
             </svg>
-            <span
-              v-if="hasTaskData"
-              class="ml-1 h-2 w-2 rounded-full"
-              :class="taskIndicatorClass"
-              aria-hidden="true"
-            ></span>
           </button>
           <div
             v-if="showMoreActions"
@@ -100,18 +139,26 @@
               type="button"
               class="flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm text-foreground transition-colors
                      hover:bg-accent"
-              @click="openTaskModal(); closeMoreActions()"
+              @click="triggerImportFile(); closeMoreActions()"
             >
-              任务状态
+              导入文件
+            </button>
+            <button
+              type="button"
+              class="flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm text-foreground transition-colors
+                     hover:bg-accent"
+              @click="openExportModal(); closeMoreActions()"
+            >
+              导出账户
             </button>
             <div class="my-1 border-t border-border/60"></div>
             <button
               type="button"
               class="flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm transition-colors"
-              :class="isRefreshing
+              :class="isRegistering
                 ? 'cursor-not-allowed text-muted-foreground'
                 : 'text-foreground hover:bg-accent'"
-              :disabled="isRefreshing"
+              :disabled="isRegistering"
               @click="handleRefreshExpiring(); closeMoreActions()"
             >
               刷新过期
@@ -119,10 +166,10 @@
             <button
               type="button"
               class="flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm transition-colors"
-              :class="!selectedCount || isRefreshing
+              :class="!selectedCount || isRegistering
                 ? 'cursor-not-allowed text-muted-foreground'
                 : 'text-foreground hover:bg-accent'"
-              :disabled="!selectedCount || isRefreshing"
+              :disabled="!selectedCount || isRegistering"
               @click="handleRefreshSelected(); closeMoreActions()"
             >
               刷新选中
@@ -131,35 +178,56 @@
             <button
               type="button"
               class="flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm transition-colors"
-              :class="!selectedCount
+              :class="!selectedCount || isOperating
                 ? 'cursor-not-allowed text-muted-foreground'
                 : 'text-foreground hover:bg-accent'"
-              :disabled="!selectedCount"
+              :disabled="!selectedCount || isOperating"
               @click="handleBulkEnable(); closeMoreActions()"
             >
-              批量启用
+              <span v-if="isOperating" class="flex items-center gap-2">
+                <svg class="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                处理中...
+              </span>
+              <span v-else>批量启用</span>
             </button>
             <button
               type="button"
               class="flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm transition-colors"
-              :class="!selectedCount
+              :class="!selectedCount || isOperating
                 ? 'cursor-not-allowed text-muted-foreground'
                 : 'text-foreground hover:bg-accent'"
-              :disabled="!selectedCount"
+              :disabled="!selectedCount || isOperating"
               @click="handleBulkDisable(); closeMoreActions()"
             >
-              批量禁用
+              <span v-if="isOperating" class="flex items-center gap-2">
+                <svg class="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                处理中...
+              </span>
+              <span v-else>批量禁用</span>
             </button>
             <button
               type="button"
               class="flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm transition-colors"
-              :class="!selectedCount
+              :class="!selectedCount || isOperating
                 ? 'cursor-not-allowed text-muted-foreground'
                 : 'text-destructive hover:bg-destructive/10'"
-              :disabled="!selectedCount"
+              :disabled="!selectedCount || isOperating"
               @click="handleBulkDelete(); closeMoreActions()"
             >
-              批量删除
+              <span v-if="isOperating" class="flex items-center gap-2">
+                <svg class="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                处理中...
+              </span>
+              <span v-else>批量删除</span>
             </button>
           </div>
         </div>
@@ -178,22 +246,25 @@
               <p class="text-xs text-muted-foreground">账号 ID</p>
               <p class="mt-1 font-mono text-xs text-foreground">{{ account.id }}</p>
             </div>
-            <div class="flex items-center gap-2">
-              <Checkbox
-                :modelValue="selectedIds.has(account.id)"
-                @update:modelValue="toggleSelect(account.id)"
-                @click.stop
-              />
-              <span
-                class="inline-flex items-center rounded-full border border-border px-3 py-1 text-xs"
-                :class="statusClass(account)"
-              >
-                {{ statusLabel(account) }}
-              </span>
-            </div>
+            <Checkbox
+              :modelValue="selectedIds.has(account.id)"
+              @update:modelValue="toggleSelect(account.id)"
+              @click.stop
+            />
           </div>
 
           <div class="mt-4 grid grid-cols-2 gap-3 text-xs text-muted-foreground">
+            <div>
+              <p>状态</p>
+              <p class="mt-1 text-sm font-semibold text-foreground">
+                <span
+                  class="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs"
+                  :class="statusClass(account)"
+                >
+                  {{ statusLabel(account) }}
+                </span>
+              </p>
+            </div>
             <div>
               <p>剩余时间</p>
               <p class="mt-1 text-sm font-semibold" :class="remainingClass(account)">
@@ -204,22 +275,18 @@
               </p>
             </div>
             <div>
-              <p>冷却</p>
-              <p class="mt-1" :class="cooldownClass(account)">
-                <span v-if="account.cooldown_seconds > 0">
-                  {{ formatCooldown(account.cooldown_seconds) }} · {{ account.cooldown_reason }}
-                </span>
-                <span v-else>
-                  {{ account.cooldown_reason || '无冷却' }}
-                </span>
-              </p>
+              <p>配额</p>
+              <div class="mt-1">
+                <QuotaBadge v-if="account.quota_status" :quota-status="account.quota_status" />
+                <span v-else class="text-xs text-muted-foreground">-</span>
+              </div>
             </div>
             <div>
               <p>失败数</p>
-              <p class="mt-1 text-sm font-semibold text-foreground">{{ account.error_count }}</p>
+              <p class="mt-1 text-sm font-semibold text-foreground">{{ account.failure_count }}</p>
             </div>
             <div>
-              <p>会话数</p>
+              <p>成功数</p>
               <p class="mt-1 text-sm font-semibold text-foreground">{{ account.conversation_count }}</p>
             </div>
           </div>
@@ -280,9 +347,9 @@
                   <HelpTip text="过期时间为 12 小时，账户过期以北京时间为准。" />
                 </span>
               </th>
-              <th class="py-3 pr-6">冷却</th>
+              <th class="py-3 pr-6">配额</th>
               <th class="py-3 pr-6">失败数</th>
-              <th class="py-3 pr-6">会话数</th>
+              <th class="py-3 pr-6">成功数</th>
               <th class="py-3 text-right">操作</th>
             </tr>
           </thead>
@@ -324,16 +391,12 @@
                   {{ account.expires_at }}
                 </span>
               </td>
-              <td class="py-4 pr-6 text-xs">
-                <span v-if="account.cooldown_seconds > 0" :class="cooldownClass(account)">
-                  {{ formatCooldown(account.cooldown_seconds) }} · {{ account.cooldown_reason }}
-                </span>
-                <span v-else :class="cooldownClass(account)">
-                  {{ account.cooldown_reason || '无冷却' }}
-                </span>
+              <td class="py-4 pr-6">
+                <QuotaBadge v-if="account.quota_status" :quota-status="account.quota_status" />
+                <span v-else class="text-xs text-muted-foreground">-</span>
               </td>
               <td class="py-4 pr-6 text-xs text-muted-foreground">
-                {{ account.error_count }}
+                {{ account.failure_count }}
               </td>
               <td class="py-4 pr-6 text-xs text-muted-foreground">
                 {{ account.conversation_count }}
@@ -402,16 +465,6 @@
       </div>
     </section>
   </div>
-  <ConfirmDialog
-    :open="confirmDialog.open.value"
-    :title="confirmDialog.title.value"
-    :message="confirmDialog.message.value"
-    :confirm-text="confirmDialog.confirmText.value"
-    :cancel-text="confirmDialog.cancelText.value"
-    @confirm="confirmDialog.confirm"
-    @cancel="confirmDialog.cancel"
-  />
-  
   <Teleport to="body">
     <div v-if="isRegisterOpen" class="fixed inset-0 z-[100] flex items-center justify-center bg-black/30 px-4">
       <div class="flex max-h-[90vh] w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-border bg-card shadow-xl">
@@ -419,7 +472,7 @@
           <div>
             <p class="text-sm font-medium text-foreground">添加账户</p>
             <p class="mt-1 text-xs text-muted-foreground">
-              {{ addMode === 'register' ? '创建 DuckMail 账号并自动注册' : '批量导入账户配置' }}
+              {{ addMode === 'register' ? '创建临时邮箱账号并自动注册' : '批量导入账户配置' }}
             </p>
           </div>
           <button
@@ -452,6 +505,12 @@
           </div>
 
           <div v-if="addMode === 'register'" class="space-y-4">
+            <label class="block text-xs text-muted-foreground">临时邮箱服务</label>
+            <SelectMenu
+              v-model="selectedMailProvider"
+              :options="mailProviderOptions"
+              class="w-full"
+            />
             <label class="block text-xs text-muted-foreground">注册数量</label>
             <input
               v-model.number="registerCount"
@@ -459,22 +518,32 @@
               min="1"
               class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
             />
-            <div class="rounded-2xl border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-              <p>默认域名（可在配置面板修改，推荐使用）</p>
-              <p class="mt-1">注册失败建议关闭无头浏览器再试</p>
-            </div>
           </div>
 
           <div v-else class="space-y-4">
             <label class="block text-xs text-muted-foreground">批量导入（每行一个）</label>
+            <div class="flex items-center gap-2">
+              <button
+                type="button"
+                class="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground transition-colors
+                       hover:border-primary hover:text-primary"
+                @click="triggerImportFile"
+              >
+                上传文件
+              </button>
+              <span v-if="importFileName" class="text-xs text-muted-foreground">{{ importFileName }}</span>
+            </div>
             <textarea
               v-model="importText"
               class="min-h-[140px] w-full rounded-2xl border border-input bg-background px-3 py-2 text-xs font-mono"
-              placeholder="duckmail----you@example.com----password&#10;user@outlook.com----loginPassword----clientId----refreshToken"
+              placeholder="duckmail----you@example.com----password&#10;moemail----you@moemail.app----emailId&#10;freemail----you@freemail.local&#10;gptmail----you@example.com&#10;user@outlook.com----loginPassword----clientId----refreshToken"
             ></textarea>
             <div class="rounded-2xl border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-              <p>支持两种格式：</p>
+              <p>支持三种格式：</p>
               <p class="mt-1 font-mono">duckmail----email----password</p>
+              <p class="mt-1 font-mono">moemail----email----emailId</p>
+              <p class="mt-1 font-mono">freemail----email</p>
+              <p class="mt-1 font-mono">gptmail----email</p>
               <p class="mt-1 font-mono">email----password----clientId----refreshToken</p>
               <p class="mt-2">导入后请执行一次"刷新选中"以获取 Cookie。</p>
               <p class="mt-1">注册失败建议关闭无头浏览器再试</p>
@@ -485,12 +554,14 @@
           </div>
 
           <div class="rounded-2xl border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] leading-relaxed">
-            <p class="text-xs font-bold text-rose-600">⚠️ 严禁滥用：禁止将本工具用于商业用途或任何形式的滥用（无论规模大小）</p>
+            <p class="flex items-center gap-1.5 text-xs font-bold text-rose-600">
+              <svg class="h-4 w-4 flex-shrink-0" viewBox="0 0 20 20" fill="currentColor">
+                <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd" />
+              </svg>
+              严禁滥用：禁止将本工具用于商业用途或任何形式的滥用（无论规模大小）
+            </p>
             <p class="mt-1 text-muted-foreground">详细声明请查看项目 <a href="https://github.com/Dreamy-rain/gemini-business2api/blob/main/docs/DISCLAIMER.md" target="_blank" class="text-primary hover:underline font-medium">DISCLAIMER.md</a></p>
           </div>
-          <Checkbox v-model="registerAgreed">
-            我已阅读并同意上述说明与限制
-          </Checkbox>
           </div>
         </div>
 
@@ -507,7 +578,7 @@
               v-if="addMode === 'register'"
               class="rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity
                      hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-              :disabled="isRegistering || !registerAgreed"
+              :disabled="isRegistering"
               @click="handleRegister"
             >
               开始注册
@@ -516,7 +587,7 @@
               v-else
               class="rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity
                      hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
-              :disabled="isImporting || !registerAgreed"
+              :disabled="isImporting"
               @click="handleImport"
             >
               导入并保存
@@ -532,69 +603,123 @@
       <div class="flex h-[80vh] w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-border bg-card shadow-xl">
         <div class="flex items-center justify-between border-b border-border/60 px-6 py-4">
           <div>
-            <p class="text-sm font-medium text-foreground">任务状态</p>
-            <p class="mt-1 text-xs text-muted-foreground">注册与刷新任务的状态与日志</p>
+            <p class="text-sm font-medium text-foreground">任务管理</p>
+            <p class="mt-1 text-xs text-muted-foreground">管理注册与刷新任务</p>
           </div>
-          <div class="flex items-center gap-2">
-            <button
-              class="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground transition-colors
-                     hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
-              :disabled="!registerLogs.length && !loginLogs.length && !registerTask && !loginTask && !automationError"
-              @click="clearTaskLogs"
-            >
-              清空日志
-            </button>
-            <button
-              class="text-xs text-muted-foreground transition-colors hover:text-foreground"
-              @click="closeTaskModal"
-            >
-              关闭
-            </button>
-          </div>
+          <button
+            class="text-xs text-muted-foreground transition-colors hover:text-foreground"
+            @click="closeTaskModal"
+          >
+            关闭
+          </button>
         </div>
-        <div class="flex min-h-0 flex-1 flex-col px-6 py-4">
-          <div v-if="automationError" class="rounded-2xl bg-destructive/10 px-3 py-2 text-xs text-destructive">
-            {{ automationError }}
-          </div>
 
-          <div v-if="registerTask || loginTask" class="grid gap-3 text-xs text-muted-foreground">
+        <!-- Tab 导航 -->
+        <div class="flex border-b border-border/60 px-6">
+          <button
+            type="button"
+            class="relative px-4 py-3 text-sm font-medium transition-colors"
+            :class="activeTaskTab === 'current' ? 'text-primary' : 'text-muted-foreground hover:text-foreground'"
+            @click="activeTaskTab = 'current'"
+          >
+            当前任务
+            <span
+              v-if="activeTaskTab === 'current'"
+              class="absolute bottom-0 left-0 right-0 h-0.5 bg-primary"
+            ></span>
+          </button>
+          <button
+            type="button"
+            class="relative px-4 py-3 text-sm font-medium transition-colors"
+            :class="activeTaskTab === 'scheduled' ? 'text-primary' : 'text-muted-foreground hover:text-foreground'"
+            @click="activeTaskTab = 'scheduled'; loadScheduledConfig()"
+          >
+            定时任务
+            <span
+              v-if="activeTaskTab === 'scheduled'"
+              class="absolute bottom-0 left-0 right-0 h-0.5 bg-primary"
+            ></span>
+          </button>
+          <button
+            type="button"
+            class="relative px-4 py-3 text-sm font-medium transition-colors"
+            :class="activeTaskTab === 'history' ? 'text-primary' : 'text-muted-foreground hover:text-foreground'"
+            @click="activeTaskTab = 'history'"
+          >
+            历史记录
+            <span
+              v-if="activeTaskTab === 'history'"
+              class="absolute bottom-0 left-0 right-0 h-0.5 bg-primary"
+            ></span>
+          </button>
+        </div>
+
+        <!-- 当前任务 Tab -->
+        <div v-if="activeTaskTab === 'current'" class="flex min-h-0 flex-1 flex-col">
+          <!-- 固定任务信息区域 -->
+          <div v-if="automationError || registerTask || loginTask" class="px-6 py-4">
+            <div v-if="automationError" class="rounded-2xl bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              {{ automationError }}
+            </div>
+
+            <div v-if="registerTask || loginTask" class="grid gap-3 text-xs text-muted-foreground">
             <div v-if="registerTask" class="space-y-1">
-              <div class="flex items-center gap-2 font-medium text-foreground">
-                <span
-                  class="h-2.5 w-2.5 rounded-full"
-                  :class="getTaskStatusIndicatorClass(registerTask)"
-                  aria-hidden="true"
-                ></span>
-                注册任务
+              <div class="flex items-center justify-between gap-3 font-medium text-foreground">
+                <div class="flex items-center gap-2">
+                  <span
+                    class="h-2.5 w-2.5 rounded-full"
+                    :class="getTaskStatusIndicatorClass(registerTask)"
+                    aria-hidden="true"
+                  ></span>
+                  注册任务
+                </div>
+                <button
+                  v-if="registerTask.status === 'running' || registerTask.status === 'pending'"
+                  class="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground transition-colors hover:border-rose-500 hover:text-rose-600"
+                  @click="cancelRegister(registerTask.id)"
+                >
+                  中断
+                </button>
               </div>
               <div class="flex flex-wrap gap-x-4 gap-y-1">
-                <span>状态：{{ formatTaskStatus(registerTask.status) }}</span>
+                <span>状态：{{ formatTaskStatus(registerTask) }}</span>
                 <span>进度：{{ registerTask.progress }}/{{ registerTask.count }}</span>
                 <span>成功：{{ registerTask.success_count }}</span>
                 <span>失败：{{ registerTask.fail_count }}</span>
               </div>
             </div>
             <div v-if="loginTask" class="space-y-1">
-              <div class="flex items-center gap-2 font-medium text-foreground">
-                <span
-                  class="h-2.5 w-2.5 rounded-full"
-                  :class="getTaskStatusIndicatorClass(loginTask)"
-                  aria-hidden="true"
-                ></span>
-                刷新任务
+              <div class="flex items-center justify-between gap-3 font-medium text-foreground">
+                <div class="flex items-center gap-2">
+                  <span
+                    class="h-2.5 w-2.5 rounded-full"
+                    :class="getTaskStatusIndicatorClass(loginTask)"
+                    aria-hidden="true"
+                  ></span>
+                  刷新任务
+                </div>
+                <button
+                  v-if="loginTask.status === 'running' || loginTask.status === 'pending'"
+                  class="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground transition-colors hover:border-rose-500 hover:text-rose-600"
+                  @click="cancelLogin(loginTask.id)"
+                >
+                  中断
+                </button>
               </div>
               <div class="flex flex-wrap gap-x-4 gap-y-1">
-                <span>状态：{{ formatTaskStatus(loginTask.status) }}</span>
+                <span>状态：{{ formatTaskStatus(loginTask) }}</span>
                 <span>进度：{{ loginTask.progress }}/{{ loginTask.account_ids.length }}</span>
                 <span>成功：{{ loginTask.success_count }}</span>
                 <span>失败：{{ loginTask.fail_count }}</span>
               </div>
             </div>
           </div>
+          </div>
 
+          <!-- 日志区域（独立滚动） -->
           <div
-            v-if="registerLogs.length || loginLogs.length"
-            class="mt-4 flex min-h-0 flex-1 flex-col"
+            v-if="registerTask || loginTask || registerLogs.length || loginLogs.length"
+            class="flex min-h-0 flex-1 flex-col px-6 pb-4"
           >
             <div
               ref="taskLogsRef"
@@ -616,13 +741,178 @@
                   </div>
                 </div>
               </div>
+              <div v-if="!registerLogs.length && !loginLogs.length" class="text-xs text-muted-foreground">
+                日志已清空，新的日志会继续显示。
+              </div>
             </div>
           </div>
+
           <div
             v-if="!automationError && !registerTask && !loginTask && !registerLogs.length && !loginLogs.length"
-            class="mt-4 rounded-2xl border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground"
+            class="flex-1 px-6 py-4"
           >
-            暂无任务
+            <div class="rounded-2xl border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+              暂无任务
+            </div>
+          </div>
+
+          <!-- 固定底部按钮区域 -->
+          <div class="flex items-center justify-end gap-2 border-t border-border/60 px-6 py-4">
+            <button
+              class="rounded-full border border-border px-4 py-2 text-sm text-muted-foreground transition-colors
+                     hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+              :disabled="!registerLogs.length && !loginLogs.length && !registerTask && !loginTask && !automationError"
+              @click="clearTaskLogs"
+            >
+              清空日志
+            </button>
+          </div>
+        </div>
+
+        <!-- 定时任务 Tab -->
+        <div v-if="activeTaskTab === 'scheduled'" class="flex min-h-0 flex-1 flex-col">
+          <div class="flex min-h-0 flex-1 flex-col">
+              <div class="flex-1 overflow-y-auto px-6 py-4">
+                <div class="space-y-4">
+                  <div class="space-y-3">
+                    <div class="flex items-center justify-between">
+                      <div>
+                        <p class="text-sm font-medium text-foreground">启用定时刷新</p>
+                        <p class="mt-1 text-xs text-muted-foreground">自动检测并刷新即将过期的账号</p>
+                      </div>
+                      <button
+                        type="button"
+                        class="relative inline-flex h-5 w-10 items-center rounded-full transition-colors"
+                        :class="scheduledRefreshEnabled ? 'bg-primary' : 'bg-muted'"
+                        @click="scheduledRefreshEnabled = !scheduledRefreshEnabled"
+                      >
+                        <span
+                          class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform"
+                          :class="scheduledRefreshEnabled ? 'translate-x-5' : 'translate-x-1'"
+                        ></span>
+                      </button>
+                    </div>
+
+                    <div class="space-y-2">
+                      <label class="block text-xs text-muted-foreground">检测间隔（分钟）</label>
+                      <input
+                        v-model.number="scheduledRefreshInterval"
+                        type="number"
+                        min="0"
+                        max="720"
+                        class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
+                      />
+                      <p class="text-xs text-muted-foreground">
+                        范围：0-720 分钟（{{ Math.floor(scheduledRefreshInterval / 60) }} 小时 {{ scheduledRefreshInterval % 60 }} 分钟）
+                      </p>
+                    </div>
+
+                    <div class="space-y-2">
+                      <label class="block text-xs text-muted-foreground">过期刷新窗口（小时）</label>
+                      <input
+                        v-model.number="refreshWindowHours"
+                        type="number"
+                        min="1"
+                        max="168"
+                        class="w-full rounded-2xl border border-input bg-background px-3 py-2 text-sm"
+                      />
+                      <p class="text-xs text-muted-foreground">
+                        当账号距离过期小于等于该值时，会触发自动刷新
+                      </p>
+                    </div>
+
+                    <div class="rounded-2xl border border-border bg-muted/30 px-4 py-3 text-xs text-muted-foreground">
+                      <p class="mb-2 font-medium text-foreground">说明</p>
+                      <ul class="list-inside list-disc space-y-1">
+                        <li>定时任务会在后台自动运行，无需手动触发</li>
+                        <li>每次检测会自动刷新即将过期的账号（距离过期 ≤ 过期刷新窗口）</li>
+                        <li>修改配置后立即生效，无需重启服务</li>
+                        <li>禁用后，定时任务将停止运行</li>
+                      </ul>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+            <!-- 固定底部按钮区域 -->
+            <div class="flex items-center justify-end gap-2 border-t border-border/60 px-6 py-4">
+              <button
+                class="rounded-full border border-border px-4 py-2 text-sm text-muted-foreground transition-colors
+                       hover:border-primary hover:text-primary"
+                @click="loadScheduledConfig"
+              >
+                重置
+              </button>
+              <button
+                class="rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity
+                       hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                :disabled="isSavingScheduledConfig"
+                @click="saveScheduledConfig"
+              >
+                保存配置
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 历史记录 Tab -->
+        <div v-if="activeTaskTab === 'history'" class="flex min-h-0 flex-1 flex-col">
+          <div class="flex-1 overflow-y-auto px-6 py-4">
+            <div v-if="isLoadingHistory" class="flex items-center justify-center py-8">
+              <svg class="h-6 w-6 animate-spin text-muted-foreground" viewBox="0 0 24 24" fill="none">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+              </svg>
+            </div>
+            <div v-else-if="taskHistory.length === 0" class="rounded-2xl border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+              <p class="font-medium text-foreground mb-2">暂无历史记录</p>
+              <p>完成的任务将显示在这里</p>
+            </div>
+            <div v-else class="space-y-3">
+              <div
+                v-for="(record, index) in taskHistory"
+                :key="index"
+                class="rounded-2xl border border-border bg-card px-4 py-3 text-sm"
+              >
+                <div class="flex items-center justify-between mb-2">
+                  <span class="flex items-center gap-2 font-medium text-foreground">
+                    <span
+                      class="h-2.5 w-2.5 rounded-full"
+                      :class="getHistoryStatusIndicatorClass(record)"
+                      aria-hidden="true"
+                    ></span>
+                    {{ record.type === 'login' ? '刷新任务' : '注册任务' }}
+                  </span>
+                  <span class="text-xs text-muted-foreground">
+                    {{ new Date(record.created_at * 1000).toLocaleString('zh-CN') }}
+                  </span>
+                </div>
+                <div class="text-xs text-muted-foreground space-y-1">
+                  <div>
+                    状态：<span :class="getHistoryStatusTextClass(record)">
+                      {{ formatTaskStatus(record) }}
+                    </span>
+                  </div>
+                  <div class="flex flex-wrap gap-x-4 gap-y-1">
+                    <span>进度：{{ record.progress }}/{{ getHistoryTotal(record) }}</span>
+                    <span>成功：{{ record.success_count }}</span>
+                    <span>失败：{{ record.fail_count }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 固定底部按钮区域 -->
+          <div class="flex items-center justify-end gap-2 border-t border-border/60 px-6 py-4">
+            <button
+              class="rounded-full border border-border px-4 py-2 text-sm text-muted-foreground transition-colors
+                     hover:border-primary hover:text-primary disabled:cursor-not-allowed disabled:opacity-50"
+              :disabled="taskHistory.length === 0"
+              @click="clearTaskHistory"
+            >
+              清空历史
+            </button>
           </div>
         </div>
       </div>
@@ -766,23 +1056,117 @@
       </div>
     </div>
   </Teleport>
+  <Teleport to="body">
+    <div v-if="isExportOpen" class="fixed inset-0 z-[100] flex items-center justify-center bg-black/30 px-4">
+      <div class="flex max-h-[90vh] w-full max-w-md flex-col overflow-hidden rounded-3xl border border-border bg-card shadow-xl">
+        <div class="flex items-center justify-between border-b border-border/60 px-6 py-4">
+          <div>
+            <p class="text-sm font-medium text-foreground">导出账号配置</p>
+            <p class="mt-1 text-xs text-muted-foreground">选择导出范围与格式</p>
+          </div>
+          <button
+            class="text-xs text-muted-foreground transition-colors hover:text-foreground"
+            @click="closeExportModal"
+          >
+            关闭
+          </button>
+        </div>
+        <div class="scrollbar-slim flex-1 overflow-y-auto px-6 py-4">
+          <div class="space-y-4 text-sm">
+            <div class="flex rounded-full border border-border bg-muted/30 p-1 text-xs">
+              <button
+                type="button"
+                class="flex-1 rounded-full px-3 py-2 font-medium transition-colors"
+                :class="exportScope === 'all' ? 'bg-foreground text-background' : 'text-muted-foreground hover:text-foreground'"
+                @click="exportScope = 'all'"
+              >
+                全部
+              </button>
+              <button
+                type="button"
+                class="flex-1 rounded-full px-3 py-2 font-medium transition-colors"
+                :class="exportScope === 'selected' ? 'bg-foreground text-background' : 'text-muted-foreground hover:text-foreground'"
+                :disabled="!selectedCount"
+                @click="exportScope = 'selected'"
+              >
+                选中
+              </button>
+            </div>
+
+            <div class="flex rounded-full border border-border bg-muted/30 p-1 text-xs">
+              <button
+                type="button"
+                class="flex-1 rounded-full px-3 py-2 font-medium transition-colors"
+                :class="exportFormat === 'json' ? 'bg-foreground text-background' : 'text-muted-foreground hover:text-foreground'"
+                @click="exportFormat = 'json'"
+              >
+                JSON
+              </button>
+              <button
+                type="button"
+                class="flex-1 rounded-full px-3 py-2 font-medium transition-colors"
+                :class="exportFormat === 'txt' ? 'bg-foreground text-background' : 'text-muted-foreground hover:text-foreground'"
+                @click="exportFormat = 'txt'"
+              >
+                TXT
+              </button>
+            </div>
+            <p class="text-xs text-muted-foreground">
+              选中导出仅包含当前已勾选账号（{{ selectedCount }} 个）。
+            </p>
+          </div>
+        </div>
+        <div class="border-t border-border/60 px-6 py-4">
+          <div class="flex items-center justify-end gap-2">
+            <button
+              class="rounded-full border border-border px-4 py-2 text-sm text-muted-foreground transition-colors
+                     hover:border-primary hover:text-primary"
+              @click="closeExportModal"
+            >
+              取消
+            </button>
+            <button
+              class="rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-opacity
+                     hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+              :disabled="exportScope === 'selected' && !selectedCount"
+              @click="runExport"
+            >
+              开始导出
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </Teleport>
+  <input
+    ref="importFileInput"
+    type="file"
+    class="hidden"
+    accept=".txt,.json,application/json,text/plain"
+    @change="handleImportFile"
+  />
 </template>
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { useAccountsStore } from '@/stores'
+import { useAccountsStore } from '@/stores/accounts'
+import { useSettingsStore } from '@/stores/settings'
 import SelectMenu from '@/components/ui/SelectMenu.vue'
 import Checkbox from '@/components/ui/Checkbox.vue'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
+import QuotaBadge from '@/components/QuotaBadge.vue'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { useToast } from '@/composables/useToast'
 import HelpTip from '@/components/ui/HelpTip.vue'
-import { accountsApi } from '@/api'
+import { accountsApi, settingsApi } from '@/api'
+import { mailProviderOptions, defaultMailProvider } from '@/constants/mailProviders'
 import type { AdminAccount, AccountConfigItem, RegisterTask, LoginTask } from '@/types/api'
 
 const accountsStore = useAccountsStore()
-const { accounts, isLoading } = storeToRefs(accountsStore)
+const { accounts, isLoading, isOperating, batchProgress } = storeToRefs(accountsStore)
+const settingsStore = useSettingsStore()
+const { settings } = storeToRefs(settingsStore)
 const confirmDialog = useConfirmDialog()
 const toast = useToast()
 
@@ -800,23 +1184,37 @@ const configJson = ref('')
 const configMasked = ref(false)
 const configData = ref<AccountConfigItem[]>([])
 const registerCount = ref(1)
+const selectedMailProvider = ref(settings.value?.basic?.temp_mail_provider || defaultMailProvider)
 const isRegisterOpen = ref(false)
 const addMode = ref<'register' | 'import'>('register')
 const importText = ref('')
 const importError = ref('')
 const isImporting = ref(false)
+const importFileInput = ref<HTMLInputElement | null>(null)
+const importFileName = ref('')
+const isExportOpen = ref(false)
+const exportScope = ref<'all' | 'selected'>('all')
+const exportFormat = ref<'json' | 'txt'>('json')
 const isTaskOpen = ref(false)
+const activeTaskTab = ref<'current' | 'scheduled' | 'history'>('current')
 const showMoreActions = ref(false)
 const moreActionsRef = ref<HTMLDivElement | null>(null)
 const lastRegisterTaskId = ref<string | null>(null)
 const lastLoginTaskId = ref<string | null>(null)
-const clearedRegisterTaskId = ref<string | null>(null)
-const clearedLoginTaskId = ref<string | null>(null)
-const registerLogClearOffset = ref(0)
-const loginLogClearOffset = ref(0)
-const registerAgreed = ref(false)
+const scheduledRefreshEnabled = ref(false)
+const scheduledRefreshInterval = ref(30)
+const refreshWindowHours = ref(24)
+const isLoadingScheduledConfig = ref(false)
+const isSavingScheduledConfig = ref(false)
+const cachedSettings = ref<any>(null)  // 缓存配置以避免重复API调用
+const taskHistory = ref<any[]>([])  // 任务历史记录
+const isLoadingHistory = ref(false)  // 加载历史记录状态
+type TaskLogLine = { time: string; level: string; message: string }
+const registerLogClearMarker = ref<TaskLogLine | null>(null)
+const loginLogClearMarker = ref<TaskLogLine | null>(null)
 const registerTask = ref<RegisterTask | null>(null)
 const loginTask = ref<LoginTask | null>(null)
+const refreshingAccountIds = ref<Set<string>>(new Set())  // 正在刷新的账户ID集合（仅用于显示状态）
 const taskLogsRef = ref<HTMLDivElement | null>(null)
 const isRegistering = ref(false)
 const isRefreshing = ref(false)
@@ -825,8 +1223,24 @@ const REGISTER_TASK_CACHE_KEY = 'accounts-register-task-cache'
 const LOGIN_TASK_CACHE_KEY = 'accounts-login-task-cache'
 const REGISTER_CLEAR_KEY = 'accounts-register-log-clear'
 const LOGIN_CLEAR_KEY = 'accounts-login-log-clear'
-const REGISTER_CLEARED_TASK_KEY = 'accounts-register-task-cleared-id'
-const LOGIN_CLEARED_TASK_KEY = 'accounts-login-task-cleared-id'
+const REGISTER_DISMISS_KEY = 'accounts-register-task-dismissed'
+const LOGIN_DISMISS_KEY = 'accounts-login-task-dismissed'
+const REGISTER_CLEARED_KEY = 'accounts-register-task-cleared'
+const LOGIN_CLEARED_KEY = 'accounts-login-task-cleared'
+
+type TaskKind = 'register' | 'login'
+const TASK_KEYS = {
+  register: {
+    clearKey: REGISTER_CLEAR_KEY,
+    dismissKey: REGISTER_DISMISS_KEY,
+    clearedKey: REGISTER_CLEARED_KEY,
+  },
+  login: {
+    clearKey: LOGIN_CLEAR_KEY,
+    dismissKey: LOGIN_DISMISS_KEY,
+    clearedKey: LOGIN_CLEARED_KEY,
+  },
+} as const
 const editForm = ref<AccountConfigItem>({
   id: '',
   secure_c_ses: '',
@@ -843,7 +1257,6 @@ const statusOptions = [
   { label: '即将过期', value: '即将过期' },
   { label: '已过期', value: '已过期' },
   { label: '手动禁用', value: '手动禁用' },
-  { label: '错误禁用', value: '错误禁用' },
   { label: '429限流', value: '429限流' },
 ]
 
@@ -888,26 +1301,6 @@ const readCachedTask = <T,>(key: string): T | null => {
   }
 }
 
-const readClearedTaskId = (key: string) => {
-  try {
-    return localStorage.getItem(key) || null
-  } catch {
-    return null
-  }
-}
-
-const writeClearedTaskId = (key: string, value: string | null) => {
-  try {
-    if (value) {
-      localStorage.setItem(key, value)
-      return
-    }
-    localStorage.removeItem(key)
-  } catch {
-    // ignore storage errors
-  }
-}
-
 const writeCachedTask = (key: string, value: unknown) => {
   try {
     localStorage.setItem(key, JSON.stringify(value))
@@ -916,7 +1309,7 @@ const writeCachedTask = (key: string, value: unknown) => {
   }
 }
 
-const clearCachedTask = (key: string) => {
+const removeCachedTask = (key: string) => {
   try {
     localStorage.removeItem(key)
   } catch {
@@ -924,32 +1317,221 @@ const clearCachedTask = (key: string) => {
   }
 }
 
-const readClearOffset = (key: string) => {
-  const raw = localStorage.getItem(key)
-  const value = Number(raw)
-  return Number.isFinite(value) ? value : 0
+type DismissedTaskMeta = { id?: string; created_at?: number } | null
+
+const readDismissedTaskMeta = (key: string): DismissedTaskMeta => {
+  try {
+    const raw = localStorage.getItem(key)
+    if (!raw) return null
+    try {
+      const parsed = JSON.parse(raw) as Partial<{ id: string; created_at: number }>
+      if (parsed && (parsed.id || typeof parsed.created_at === 'number')) {
+        return { id: parsed.id, created_at: parsed.created_at }
+      }
+    } catch {
+      // Backward compatibility: plain id string
+      return { id: raw }
+    }
+    return null
+  } catch {
+    return null
+  }
 }
 
-const writeClearOffset = (key: string, value: number) => {
+const writeDismissedTaskMeta = (key: string, meta: DismissedTaskMeta) => {
   try {
-    localStorage.setItem(key, String(value))
+    if (!meta || (!meta.id && typeof meta.created_at !== 'number')) {
+      localStorage.removeItem(key)
+      return
+    }
+    localStorage.setItem(key, JSON.stringify(meta))
+  } catch {
+    // ignore storage errors
+  }
+}
+
+const readDismissedTaskId = (key: string) => readDismissedTaskMeta(key)?.id || null
+
+const writeDismissedTaskId = (key: string, taskId: string | null) => {
+  if (!taskId) {
+    writeDismissedTaskMeta(key, null)
+    return
+  }
+  writeDismissedTaskMeta(key, { id: taskId })
+}
+
+const isTaskMetaMatch = (task: { id?: string; created_at?: number } | null | undefined, meta: DismissedTaskMeta) => {
+  if (!task || !meta) return false
+  if (meta.id && task.id && task.id === meta.id) return true
+  if (typeof meta.created_at === 'number' && typeof task.created_at === 'number' && task.created_at === meta.created_at) {
+    return true
+  }
+  return false
+}
+
+const isTaskDismissed = (task: { id?: string; created_at?: number } | null | undefined, meta: DismissedTaskMeta) =>
+  isTaskMetaMatch(task, meta)
+
+const readClearedTaskMeta = (key: string): DismissedTaskMeta => readDismissedTaskMeta(key)
+const writeClearedTaskMeta = (key: string, meta: DismissedTaskMeta) => writeDismissedTaskMeta(key, meta)
+
+const isTaskActive = (task: RegisterTask | LoginTask | null | undefined) => {
+  const status = task?.status
+  return status === 'running' || status === 'pending'
+}
+
+const getTaskByKind = (kind: TaskKind) => (kind === 'register' ? registerTask.value : loginTask.value)
+
+const markTaskCleared = (kind: TaskKind, task: RegisterTask | LoginTask) => {
+  const key = TASK_KEYS[kind].clearedKey
+  writeClearedTaskMeta(key, {
+    id: task.id,
+    created_at: task.created_at,
+  })
+}
+
+const setLogClearMarker = (kind: TaskKind, marker: TaskLogLine | null) => {
+  if (kind === 'register') {
+    registerLogClearMarker.value = marker
+  } else {
+    loginLogClearMarker.value = marker
+  }
+}
+
+const clearTaskSnapshot = (kind: TaskKind, persist = true) => {
+  if (kind === 'register') {
+    syncRegisterTask(null, persist)
+  } else {
+    syncLoginTask(null, persist)
+  }
+}
+
+const clearFinishedTask = (kind: TaskKind) => {
+  const task = getTaskByKind(kind)
+  if (!task || isTaskActive(task)) return
+  markTaskCleared(kind, task)
+  clearTaskSnapshot(kind, true)
+}
+
+const handleTaskIdle = (kind: TaskKind) => {
+  // 后端 idle：保留现有任务快照
+  cleanupCancelledTasks()
+}
+
+const handleTaskNotFound = (kind: TaskKind) => {
+  if (kind === 'register') {
+    clearRegisterTimer()
+    isRegistering.value = false
+  } else {
+    clearLoginTimer()
+    isRefreshing.value = false
+  }
+}
+
+const handleTaskActive = (kind: TaskKind, task: RegisterTask | LoginTask) => {
+  if (kind === 'register') {
+    syncRegisterTask(task)
+    isRegistering.value = true
+    startRegisterPolling(task.id)
+  } else {
+    syncLoginTask(task)
+    isRefreshing.value = true
+    startLoginPolling(task.id)
+  }
+}
+
+const handleTaskInactive = (kind: TaskKind, task: RegisterTask | LoginTask) => {
+  if (kind === 'register') {
+    syncRegisterTask(task)
+  } else {
+    syncLoginTask(task)
+  }
+}
+
+const shouldKeepInactiveTask = (kind: TaskKind, task: RegisterTask | LoginTask) => {
+  const dismissedMeta = readDismissedTaskMeta(TASK_KEYS[kind].dismissKey)
+  const clearedMeta = readClearedTaskMeta(TASK_KEYS[kind].clearedKey)
+  return !isTaskDismissed(task, dismissedMeta) && !isTaskMetaMatch(task, clearedMeta)
+}
+
+const loadCurrentTaskByKind = async (kind: TaskKind) => {
+  try {
+    const current = kind === 'register'
+      ? await accountsApi.getRegisterCurrent()
+      : await accountsApi.getLoginCurrent()
+    if (current && 'id' in current) {
+      const isActive = current.status === 'running' || current.status === 'pending'
+      if (isActive) {
+        handleTaskActive(kind, current)
+      } else if (shouldKeepInactiveTask(kind, current)) {
+        handleTaskInactive(kind, current)
+      }
+    } else {
+      handleTaskIdle(kind)
+    }
+  } catch (error: any) {
+    if (error?.status === 404 || error?.message === 'Not found') {
+      handleTaskNotFound(kind)
+    } else {
+      automationError.value = error.message || (kind === 'register' ? '加载注册任务失败' : '加载刷新任务失败')
+    }
+  }
+}
+
+const readClearMarker = (key: string): TaskLogLine | null => {
+  const raw = localStorage.getItem(key)
+  if (!raw) return null
+
+  // Backward compatibility: older versions stored numeric offsets.
+  // If we see a number, ignore it so logs still render.
+  const asNumber = Number(raw)
+  if (Number.isFinite(asNumber)) return null
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<TaskLogLine> | null
+    if (!parsed || typeof parsed !== 'object') return null
+    if (typeof parsed.time !== 'string' || typeof parsed.level !== 'string' || typeof parsed.message !== 'string') {
+      return null
+    }
+    return { time: parsed.time, level: parsed.level, message: parsed.message }
+  } catch {
+    return null
+  }
+}
+
+const writeClearMarker = (key: string, value: TaskLogLine | null) => {
+  try {
+    if (!value) {
+      localStorage.removeItem(key)
+      return
+    }
+    localStorage.setItem(key, JSON.stringify(value))
   } catch {
     // ignore storage errors
   }
 }
 
 const syncRegisterTask = (task: RegisterTask | null, persist = true) => {
-  if (!task) return
-  if (task.id && task.id === clearedRegisterTaskId.value) return
-  if (task.id && clearedRegisterTaskId.value && task.id !== clearedRegisterTaskId.value) {
-    clearedRegisterTaskId.value = null
-    writeClearedTaskId(REGISTER_CLEARED_TASK_KEY, null)
+  if (!task) {
+    registerTask.value = null
+    lastRegisterTaskId.value = null
+    registerLogClearMarker.value = null
+    if (persist) {
+      removeCachedTask(REGISTER_TASK_CACHE_KEY)
+      writeClearMarker(REGISTER_CLEAR_KEY, null)
+    }
+    return
   }
+
   registerTask.value = task
   if (task.id && task.id !== lastRegisterTaskId.value) {
     lastRegisterTaskId.value = task.id
-    registerLogClearOffset.value = 0
-    writeClearOffset(REGISTER_CLEAR_KEY, 0)
+    writeDismissedTaskMeta(REGISTER_DISMISS_KEY, null)
+    writeClearedTaskMeta(REGISTER_CLEARED_KEY, null)
+    setLogClearMarker('register', null)
+    writeClearMarker(REGISTER_CLEAR_KEY, null)
+    // 新注册任务启动时，自动清理已结束的刷新任务，避免堆叠显示
+    clearFinishedTask('login')
   }
   if (persist) {
     writeCachedTask(REGISTER_TASK_CACHE_KEY, task)
@@ -957,17 +1539,26 @@ const syncRegisterTask = (task: RegisterTask | null, persist = true) => {
 }
 
 const syncLoginTask = (task: LoginTask | null, persist = true) => {
-  if (!task) return
-  if (task.id && task.id === clearedLoginTaskId.value) return
-  if (task.id && clearedLoginTaskId.value && task.id !== clearedLoginTaskId.value) {
-    clearedLoginTaskId.value = null
-    writeClearedTaskId(LOGIN_CLEARED_TASK_KEY, null)
+  if (!task) {
+    loginTask.value = null
+    lastLoginTaskId.value = null
+    loginLogClearMarker.value = null
+    if (persist) {
+      removeCachedTask(LOGIN_TASK_CACHE_KEY)
+      writeClearMarker(LOGIN_CLEAR_KEY, null)
+    }
+    return
   }
+
   loginTask.value = task
   if (task.id && task.id !== lastLoginTaskId.value) {
     lastLoginTaskId.value = task.id
-    loginLogClearOffset.value = 0
-    writeClearOffset(LOGIN_CLEAR_KEY, 0)
+    writeDismissedTaskMeta(LOGIN_DISMISS_KEY, null)
+    writeClearedTaskMeta(LOGIN_CLEARED_KEY, null)
+    setLogClearMarker('login', null)
+    writeClearMarker(LOGIN_CLEAR_KEY, null)
+    // 新刷新任务启动时，自动清理已结束的注册任务，避免堆叠显示
+    clearFinishedTask('register')
   }
   if (persist) {
     writeCachedTask(LOGIN_TASK_CACHE_KEY, task)
@@ -975,20 +1566,30 @@ const syncLoginTask = (task: LoginTask | null, persist = true) => {
 }
 
 const hydrateTaskCache = () => {
-  registerLogClearOffset.value = readClearOffset(REGISTER_CLEAR_KEY)
-  loginLogClearOffset.value = readClearOffset(LOGIN_CLEAR_KEY)
-  clearedRegisterTaskId.value = readClearedTaskId(REGISTER_CLEARED_TASK_KEY)
-  clearedLoginTaskId.value = readClearedTaskId(LOGIN_CLEARED_TASK_KEY)
+  registerLogClearMarker.value = readClearMarker(REGISTER_CLEAR_KEY)
+  loginLogClearMarker.value = readClearMarker(LOGIN_CLEAR_KEY)
   const cachedRegister = readCachedTask<RegisterTask>(REGISTER_TASK_CACHE_KEY)
-  if (cachedRegister && cachedRegister.id !== clearedRegisterTaskId.value) {
-    registerTask.value = cachedRegister
-    lastRegisterTaskId.value = cachedRegister.id || null
+  if (cachedRegister) {
+    const dismissedMeta = readDismissedTaskMeta(TASK_KEYS.register.dismissKey)
+    const clearedMeta = readClearedTaskMeta(TASK_KEYS.register.clearedKey)
+    if (!isTaskDismissed(cachedRegister, dismissedMeta) && !isTaskMetaMatch(cachedRegister, clearedMeta)) {
+      registerTask.value = cachedRegister
+      lastRegisterTaskId.value = cachedRegister.id || null
+    }
   }
   const cachedLogin = readCachedTask<LoginTask>(LOGIN_TASK_CACHE_KEY)
-  if (cachedLogin && cachedLogin.id !== clearedLoginTaskId.value) {
-    loginTask.value = cachedLogin
-    lastLoginTaskId.value = cachedLogin.id || null
+  if (cachedLogin) {
+    const dismissedMeta = readDismissedTaskMeta(TASK_KEYS.login.dismissKey)
+    const clearedMeta = readClearedTaskMeta(TASK_KEYS.login.clearedKey)
+    if (!isTaskDismissed(cachedLogin, dismissedMeta) && !isTaskMetaMatch(cachedLogin, clearedMeta)) {
+      loginTask.value = cachedLogin
+      lastLoginTaskId.value = cachedLogin.id || null
+    }
   }
+}
+
+const cleanupCancelledTasks = () => {
+  // Keep completed/cancelled task logs; do not auto-clear.
 }
 
 const openRegisterModal = () => {
@@ -997,7 +1598,19 @@ const openRegisterModal = () => {
   importText.value = ''
   importError.value = ''
   isImporting.value = false
-  registerAgreed.value = false
+  importFileName.value = ''
+  // 重置为设置中的邮箱服务提供商
+  selectedMailProvider.value = settings.value?.basic?.temp_mail_provider || defaultMailProvider
+}
+
+const openExportModal = (format: 'json' | 'txt' = 'json') => {
+  exportFormat.value = format
+  exportScope.value = 'all'
+  isExportOpen.value = true
+}
+
+const closeExportModal = () => {
+  isExportOpen.value = false
 }
 
 const closeRegisterModal = () => {
@@ -1037,6 +1650,85 @@ const parseImportLines = (raw: string) => {
       return
     }
 
+    if (parts[0].toLowerCase() === 'moemail') {
+      if (parts.length < 3 || !parts[1] || !parts[2]) {
+        errors.push(`第 ${lineNo} 行格式错误（moemail）`)
+        return
+      }
+      const email = parts[1]
+      const emailId = parts[2]  // moemail 的 email_id 作为 password 存储
+      items.push({
+        id: email,
+        secure_c_ses: '',
+        csesidx: '',
+        config_id: '',
+        expires_at: IMPORT_EXPIRES_AT,
+        mail_provider: 'moemail',
+        mail_address: email,
+        mail_password: emailId,
+      })
+      return
+    }
+
+    if (parts[0].toLowerCase() === 'freemail') {
+      if (parts.length < 2 || !parts[1]) {
+        errors.push(`第 ${lineNo} 行格式错误（freemail）`)
+        return
+      }
+      const email = parts[1]
+
+      // 完整格式：freemail----email----base_url----jwt_token----verify_ssl----domain
+      if (parts.length >= 6) {
+        items.push({
+          id: email,
+          secure_c_ses: '',
+          csesidx: '',
+          config_id: '',
+          expires_at: IMPORT_EXPIRES_AT,
+          mail_provider: 'freemail',
+          mail_address: email,
+          mail_password: '',
+          mail_base_url: parts[2] || undefined,
+          mail_jwt_token: parts[3] || undefined,
+          mail_verify_ssl: parts[4] === 'true' || parts[4] === '1',
+          mail_domain: parts[5] || undefined,
+        })
+        return
+      }
+
+      // 简化格式：freemail----email
+      items.push({
+        id: email,
+        secure_c_ses: '',
+        csesidx: '',
+        config_id: '',
+        expires_at: IMPORT_EXPIRES_AT,
+        mail_provider: 'freemail',
+        mail_address: email,
+        mail_password: '',
+      })
+      return
+    }
+
+    if (parts[0].toLowerCase() === 'gptmail') {
+      if (parts.length < 2 || !parts[1]) {
+        errors.push(`第 ${lineNo} 行格式错误（gptmail）`)
+        return
+      }
+      const email = parts[1]
+      items.push({
+        id: email,
+        secure_c_ses: '',
+        csesidx: '',
+        config_id: '',
+        expires_at: IMPORT_EXPIRES_AT,
+        mail_provider: 'gptmail',
+        mail_address: email,
+        mail_password: '',
+      })
+      return
+    }
+
     if (parts.length >= 4 && parts[0] && parts[2] && parts[3]) {
       const email = parts[0]
       const password = parts[1] || ''
@@ -1062,6 +1754,57 @@ const parseImportLines = (raw: string) => {
   })
 
   return { items, errors }
+}
+
+const triggerImportFile = () => {
+  importFileInput.value?.click()
+}
+
+const handleImportFile = async (event: Event) => {
+  const target = event.target as HTMLInputElement
+  const file = target.files?.[0]
+  if (!file) return
+  importError.value = ''
+  importFileName.value = file.name
+
+  try {
+    const content = await file.text()
+    if (file.name.toLowerCase().endsWith('.json') || file.type.includes('json')) {
+      const parsed = JSON.parse(content)
+      const importList = Array.isArray(parsed) ? parsed : parsed?.accounts
+      if (!Array.isArray(importList)) {
+        importError.value = 'JSON 格式错误：需要数组或包含 accounts 字段'
+        return
+      }
+      const existing = await loadConfigList()
+      const next = [...existing]
+      const indexMap = new Map(next.map((acc, idx) => [acc.id, idx]))
+      const importedIds: string[] = []
+
+      importList.forEach((item: any) => {
+        const idx = indexMap.get(item.id || '')
+        if (idx === undefined) {
+          next.push(item)
+        } else {
+          next[idx] = { ...next[idx], ...item }
+        }
+        if (item.id) importedIds.push(item.id)
+      })
+
+      await accountsStore.updateConfig(next)
+      selectedIds.value = new Set(importedIds)
+      toast.success(`导入 ${importList.length} 条账号配置`)
+      closeRegisterModal()
+      return
+    }
+
+    importText.value = content
+    await handleImport()
+  } catch (error: any) {
+    importError.value = error.message || '文件解析失败'
+  } finally {
+    target.value = ''
+  }
 }
 
 const handleImport = async () => {
@@ -1143,25 +1886,92 @@ const handleImport = async () => {
   }
 }
 
+const exportConfig = async (format: 'json' | 'txt', scope: 'all' | 'selected' = 'all') => {
+  try {
+    const response = await accountsApi.getConfig()
+    let list = Array.isArray(response.accounts) ? response.accounts : []
+    if (scope === 'selected') {
+      const selected = selectedIds.value
+      list = list.filter((item) => selected.has(item.id))
+    }
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+
+    if (format === 'json') {
+      const payload = JSON.stringify(list, null, 2)
+      downloadText(payload, `accounts-${timestamp}.json`, 'application/json')
+      toast.success('导出 JSON 成功')
+      return
+    }
+
+    const lines = list.map((item) => {
+      const provider = (item.mail_provider || '').toLowerCase()
+      const email = item.mail_address || item.id || ''
+      if (!email) return ''
+      if (provider === 'moemail') {
+        return `moemail----${email}----${item.mail_password || ''}`
+      }
+      if (provider === 'freemail') {
+        return `freemail----${email}`
+      }
+      if (provider === 'gptmail') {
+        return `gptmail----${email}`
+      }
+      if (provider === 'duckmail') {
+        return `duckmail----${email}----${item.mail_password || ''}`
+      }
+      if (provider === 'microsoft' || item.mail_client_id || item.mail_refresh_token) {
+        return `${email}----${item.mail_password || ''}----${item.mail_client_id || ''}----${item.mail_refresh_token || ''}`
+      }
+      if (item.mail_password) {
+        return `duckmail----${email}----${item.mail_password}`
+      }
+      return email
+    }).filter(Boolean)
+
+    downloadText(lines.join('\n'), `accounts-${timestamp}.txt`, 'text/plain')
+    toast.success('导出 TXT 成功')
+  } catch (error: any) {
+    toast.error(error.message || '导出失败')
+  }
+}
+
+const runExport = async () => {
+  await exportConfig(exportFormat.value, exportScope.value)
+  closeExportModal()
+}
+
+const downloadText = (content: string, filename: string, mime: string) => {
+  const blob = new Blob([content], { type: mime })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
+
 const refreshTaskSnapshot = async () => {
   try {
     const tasks: Promise<void>[] = []
     const registerId = registerTask.value?.id
     const loginId = loginTask.value?.id
 
-    if (registerId && !isClearedRegisterTaskId(registerId)) {
+    if (registerId) {
       tasks.push(updateRegisterTask(registerId))
     }
-    if (loginId && !isClearedLoginTaskId(loginId)) {
+    if (loginId) {
       tasks.push(updateLoginTask(loginId))
     }
 
     if (!tasks.length) {
       await loadCurrentTasks()
-      return
+    } else {
+      await Promise.all(tasks)
     }
 
-    await Promise.all(tasks)
+    cleanupCancelledTasks()
   } catch (error: any) {
     automationError.value = error?.message || '任务状态更新失败'
   }
@@ -1169,42 +1979,178 @@ const refreshTaskSnapshot = async () => {
 
 const openTaskModal = async () => {
   isTaskOpen.value = true
+  activeTaskTab.value = 'current'
   await refreshTaskSnapshot()
+}
+
+const fetchTaskHistory = async () => {
+  isLoadingHistory.value = true
+  try {
+    const response = await fetch('/admin/task-history', {
+      headers: { 'Content-Type': 'application/json' }
+    })
+    if (!response.ok) throw new Error('获取历史记录失败')
+    const data = await response.json()
+    const history = Array.isArray(data.history) ? data.history : []
+    const dismissedRegister = readDismissedTaskMeta(REGISTER_DISMISS_KEY)
+    const dismissedLogin = readDismissedTaskMeta(LOGIN_DISMISS_KEY)
+    taskHistory.value = history.filter((record: any) => {
+      const meta = record?.type === 'register' ? dismissedRegister : dismissedLogin
+      if (!meta) return true
+      const id = typeof record?.id === 'string' ? record.id : String(record?.id || '')
+      const createdAt = typeof record?.created_at === 'number' ? record.created_at : undefined
+      if (meta.id && id && id === meta.id) return false
+      if (typeof meta.created_at === 'number' && typeof createdAt === 'number' && createdAt === meta.created_at) {
+        return false
+      }
+      return true
+    })
+  } catch (error: any) {
+    toast.error(error?.message || '获取历史记录失败')
+  } finally {
+    isLoadingHistory.value = false
+  }
+}
+
+const clearTaskHistory = async () => {
+  const confirmed = await confirmDialog.ask({
+    title: '清空历史记录',
+    message: '确定要清空所有任务历史记录吗？',
+    confirmText: '清空',
+  })
+  if (!confirmed) return
+  try {
+    const response = await fetch('/admin/task-history?confirm=yes', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' }
+    })
+    if (!response.ok) throw new Error('清空历史记录失败')
+    taskHistory.value = []
+    toast.success('历史记录已清空')
+  } catch (error: any) {
+    toast.error(error?.message || '清空历史记录失败')
+  }
 }
 
 const closeTaskModal = () => {
   isTaskOpen.value = false
+  // 关闭弹窗时，确保已中断任务不会被缓存"复活"
+  cleanupCancelledTasks()
 }
 
-const clearTaskLogs = () => {
-  const registerId = registerTask.value?.id || null
-  const loginId = loginTask.value?.id || null
-  clearedRegisterTaskId.value = registerId
-  clearedLoginTaskId.value = loginId
-  writeClearedTaskId(REGISTER_CLEARED_TASK_KEY, registerId)
-  writeClearedTaskId(LOGIN_CLEARED_TASK_KEY, loginId)
-  registerLogClearOffset.value = registerTask.value?.logs?.length || 0
-  loginLogClearOffset.value = loginTask.value?.logs?.length || 0
-  writeClearOffset(REGISTER_CLEAR_KEY, registerLogClearOffset.value)
-  writeClearOffset(LOGIN_CLEAR_KEY, loginLogClearOffset.value)
-  registerTask.value = null
-  loginTask.value = null
-  lastRegisterTaskId.value = null
-  lastLoginTaskId.value = null
+const loadScheduledConfig = async () => {
+  isLoadingScheduledConfig.value = true
+  try {
+    const settings = await settingsApi.get()
+    cachedSettings.value = settings  // 缓存配置
+    scheduledRefreshEnabled.value = settings.retry.scheduled_refresh_enabled ?? false
+    scheduledRefreshInterval.value = settings.retry.scheduled_refresh_interval_minutes ?? 30
+    refreshWindowHours.value = settings.basic.refresh_window_hours ?? 24
+  } catch (error: any) {
+    toast.error(error?.message || '加载定时任务配置失败')
+  } finally {
+    isLoadingScheduledConfig.value = false
+  }
+}
+
+const saveScheduledConfig = async () => {
+  // 验证检测间隔
+  if (isNaN(scheduledRefreshInterval.value) || !Number.isInteger(scheduledRefreshInterval.value)) {
+    toast.error('检测间隔必须是有效的整数')
+    return
+  }
+  if (scheduledRefreshInterval.value < 0 || scheduledRefreshInterval.value > 720) {
+    toast.error('检测间隔必须在 0-720 分钟之间（0-12 小时）')
+    return
+  }
+
+  // 验证过期刷新窗口
+  if (isNaN(refreshWindowHours.value) || !Number.isInteger(refreshWindowHours.value)) {
+    toast.error('过期刷新窗口必须是有效的整数')
+    return
+  }
+  if (refreshWindowHours.value < 1 || refreshWindowHours.value > 168) {
+    toast.error('过期刷新窗口必须在 1-168 小时之间')
+    return
+  }
+
+  isSavingScheduledConfig.value = true
+  try {
+    // 使用缓存的配置，避免重复API调用
+    const settings = cachedSettings.value || await settingsApi.get()
+    settings.retry.scheduled_refresh_enabled = scheduledRefreshEnabled.value
+    settings.retry.scheduled_refresh_interval_minutes = scheduledRefreshInterval.value
+    settings.basic.refresh_window_hours = refreshWindowHours.value
+    await settingsApi.update(settings)
+    cachedSettings.value = settings  // 更新缓存
+    toast.success('定时任务配置已保存')
+  } catch (error: any) {
+    toast.error(error?.message || '保存定时任务配置失败')
+  } finally {
+    isSavingScheduledConfig.value = false
+  }
+}
+
+const clearTaskLogs = async () => {
+  const confirmed = await confirmDialog.ask({
+    title: '清空当前日志',
+    message: '确定要清空当前任务日志吗？',
+    confirmText: '清空',
+  })
+  if (!confirmed) return
+  const clearLogsFor = (kind: TaskKind) => {
+    const task = getTaskByKind(kind)
+    if (!task) return
+    if (!isTaskActive(task)) {
+      markTaskCleared(kind, task)
+      clearTaskSnapshot(kind, true)
+      return
+    }
+    const logs = (task.logs || []) as TaskLogLine[]
+    if (!logs.length) return
+    const marker = logs[logs.length - 1]
+    setLogClearMarker(kind, marker)
+    writeClearMarker(TASK_KEYS[kind].clearKey, marker)
+  }
+
+  clearLogsFor('register')
+  clearLogsFor('login')
+
   automationError.value = ''
-  isRegistering.value = false
-  isRefreshing.value = false
-  clearRegisterTimer()
-  clearLoginTimer()
-  clearCachedTask(REGISTER_TASK_CACHE_KEY)
-  clearCachedTask(LOGIN_TASK_CACHE_KEY)
+  toast.success('当前日志已清空')
 }
 
-const isClearedRegisterTaskId = (taskId?: string | null) =>
-  Boolean(taskId && taskId === clearedRegisterTaskId.value)
+const filterLogsAfterMarker = (logs: TaskLogLine[], marker: TaskLogLine | null) => {
+  if (!marker) return logs
+  for (let i = logs.length - 1; i >= 0; i -= 1) {
+    const item = logs[i]
+    if (item.time === marker.time && item.level === marker.level && item.message === marker.message) {
+      return logs.slice(i + 1)
+    }
+  }
+  // Marker not found (e.g., backend truncates to last N logs) — show current logs so new logs keep appearing.
+  return logs
+}
 
-const isClearedLoginTaskId = (taskId?: string | null) =>
-  Boolean(taskId && taskId === clearedLoginTaskId.value)
+const cancelRegister = async (taskId: string) => {
+  try {
+    await accountsApi.cancelRegisterTask(taskId, 'cancelled_by_user')
+    await refreshTaskSnapshot()
+    toast.success('已请求中断注册任务')
+  } catch (error: any) {
+    toast.error(error?.message || '中断注册任务失败')
+  }
+}
+
+const cancelLogin = async (taskId: string) => {
+  try {
+    await accountsApi.cancelLoginTask(taskId, 'cancelled_by_user')
+    await refreshTaskSnapshot()
+    toast.success('已请求中断刷新任务')
+  } catch (error: any) {
+    toast.error(error?.message || '中断刷新任务失败')
+  }
+}
 
 const toggleMoreActions = () => {
   showMoreActions.value = !showMoreActions.value
@@ -1222,6 +2168,15 @@ const handleMoreActionsClick = (event: MouseEvent) => {
   }
 }
 
+// 监听标签页切换，自动加载历史记录
+watch(activeTaskTab, async (newTab) => {
+  if (newTab === 'history') {
+    await fetchTaskHistory()
+  } else if (newTab === 'scheduled') {
+    await loadScheduledConfig()
+  }
+})
+
 onMounted(async () => {
   hydrateTaskCache()
   await refreshAccounts()
@@ -1232,22 +2187,12 @@ onMounted(async () => {
 
 const registerLogs = computed(() => {
   const logs = registerTask.value?.logs || []
-  if (!registerLogClearOffset.value) return logs
-  return logs.slice(registerLogClearOffset.value)
+  return filterLogsAfterMarker(logs as TaskLogLine[], registerLogClearMarker.value)
 })
 const loginLogs = computed(() => {
   const logs = loginTask.value?.logs || []
-  if (!loginLogClearOffset.value) return logs
-  return logs.slice(loginLogClearOffset.value)
+  return filterLogsAfterMarker(logs as TaskLogLine[], loginLogClearMarker.value)
 })
-const hasTaskData = computed(() =>
-  Boolean(automationError.value) ||
-  Boolean(registerTask.value) ||
-  Boolean(loginTask.value) ||
-  registerLogs.value.length > 0 ||
-  loginLogs.value.length > 0
-)
-
 const scrollTaskLogsToBottom = async () => {
   await nextTick()
   const container = taskLogsRef.value
@@ -1267,42 +2212,23 @@ const isTaskRunning = computed(() => {
     loginStatus === 'running' ||
     loginStatus === 'pending'
 })
-const taskIndicatorClass = computed(() => {
-  if (automationError.value) return 'bg-rose-500'
-  if (isTaskRunning.value) return 'bg-sky-400'
 
-  const taskSummaries = []
-  if (registerTask.value) {
-    const success = registerTask.value.success_count ?? 0
-    const fail = registerTask.value.fail_count ?? 0
-    const total = registerTask.value.count ?? success + fail
-    taskSummaries.push({ success, fail, total, status: registerTask.value.status })
+const taskProgressText = computed(() => {
+  const register = registerTask.value
+  const login = loginTask.value
+  const registerActive = register?.status === 'running' || register?.status === 'pending'
+  const loginActive = login?.status === 'running' || login?.status === 'pending'
+
+  if (registerActive && loginActive) {
+    return `注册 ${register.progress}/${register.count} | 刷新 ${login.progress}/${login.account_ids.length}`
   }
-  if (loginTask.value) {
-    const success = loginTask.value.success_count ?? 0
-    const fail = loginTask.value.fail_count ?? 0
-    const total = loginTask.value.account_ids?.length ?? success + fail
-    taskSummaries.push({ success, fail, total, status: loginTask.value.status })
+  if (registerActive) {
+    return `注册 ${register.progress}/${register.count}`
   }
-
-  if (!taskSummaries.length) return 'bg-muted-foreground'
-
-  const totalSuccess = taskSummaries.reduce((sum, item) => sum + item.success, 0)
-  const totalFail = taskSummaries.reduce((sum, item) => sum + item.fail, 0)
-  const totalCount = taskSummaries.reduce((sum, item) => sum + (item.total || 0), 0)
-
-  if (totalSuccess > 0 && totalFail > 0) return 'bg-amber-400'
-  if (totalFail > 0 && totalSuccess === 0) return 'bg-rose-500'
-  if (totalSuccess > 0 && totalFail === 0) return 'bg-emerald-400'
-
-  if (totalCount === 0) {
-    const allSuccess = taskSummaries.every(item => item.status === 'success')
-    const anyFailed = taskSummaries.some(item => item.status === 'failed')
-    if (anyFailed) return 'bg-rose-500'
-    if (allSuccess) return 'bg-emerald-400'
+  if (loginActive) {
+    return `刷新 ${login.progress}/${login.account_ids.length}`
   }
-
-  return 'bg-muted-foreground'
+  return ''
 })
 
 onBeforeUnmount(() => {
@@ -1313,11 +2239,12 @@ onBeforeUnmount(() => {
 })
 
 const statusLabel = (account: AdminAccount) => {
+  // 检查是否正在刷新
+  if (refreshingAccountIds.value.has(account.id)) {
+    return '刷新中'
+  }
   if (account.cooldown_reason?.includes('429') && account.cooldown_seconds > 0) {
     return '429限流'
-  }
-  if (account.cooldown_reason === '错误禁用') {
-    return '错误禁用'
   }
   if (account.disabled) {
     return '手动禁用'
@@ -1333,10 +2260,13 @@ const statusLabel = (account: AdminAccount) => {
 
 const statusClass = (account: AdminAccount) => {
   const status = statusLabel(account)
+  if (status === '刷新中') {
+    return 'bg-sky-500 text-white'
+  }
   if (status === '429限流' || status === '即将过期') {
     return 'bg-amber-200 text-amber-900'
   }
-  if (status === '错误禁用' || status === '已过期') {
+  if (status === '已过期') {
     return 'bg-destructive/10 text-destructive'
   }
   if (status === '手动禁用') {
@@ -1349,7 +2279,7 @@ const shouldShowEnable = (account: AdminAccount) => {
   if (account.cooldown_reason?.includes('429') && account.cooldown_seconds > 0) {
     return true
   }
-  return account.disabled || account.cooldown_reason === '错误禁用'
+  return account.disabled
 }
 
 const displayRemaining = (value: string) => {
@@ -1363,18 +2293,6 @@ const remainingClass = (account: AdminAccount) => {
   if (account.status === '即将过期') return 'text-amber-700'
   if (account.status === '未设置') return 'text-muted-foreground'
   return 'text-emerald-600'
-}
-
-const formatCooldown = (seconds: number) => {
-  if (seconds < 60) return `${seconds} 秒`
-  if (seconds < 3600) return `${Math.ceil(seconds / 60)} 分钟`
-  return `${(seconds / 3600).toFixed(1)} 小时`
-}
-
-const cooldownClass = (account: AdminAccount) => {
-  if (account.cooldown_seconds > 0) return 'text-amber-700'
-  if (account.cooldown_reason === '错误禁用') return 'text-rose-600'
-  return 'text-muted-foreground'
 }
 
 const rowClass = (account: AdminAccount) => {
@@ -1570,11 +2488,29 @@ const saveEdit = async () => {
   }
 }
 
+const formatOpErrors = (errors: string[]) => {
+  if (!errors.length) return ''
+  const sample = errors[0]
+  return `失败 ${errors.length} 个${sample ? `，示例：${sample}` : ''}`
+}
+
+const handleOpResult = (result: { ok: boolean; errors: string[] }, successMessage: string, failMessage: string) => {
+  if (result.ok) {
+    toast.success(successMessage)
+    return true
+  }
+  const detail = formatOpErrors(result.errors)
+  toast.error(detail ? `${failMessage}（${detail}）` : failMessage)
+  return false
+}
+
 const handleBulkEnable = async () => {
+  if (isOperating.value) return
   try {
-    await accountsStore.bulkEnable(Array.from(selectedIds.value))
-    toast.success('批量启用成功')
-    selectedIds.value = new Set()
+    const result = await accountsStore.bulkEnable(Array.from(selectedIds.value))
+    if (handleOpResult(result, '批量启用成功', '批量启用失败')) {
+      selectedIds.value = new Set()
+    }
   } catch (error: any) {
     toast.error(error.message || '批量启用失败')
   }
@@ -1586,16 +2522,19 @@ const handleBulkDisable = async () => {
     message: '确定要批量禁用选中的账号吗？',
   })
   if (!confirmed) return
+  if (isOperating.value) return
   try {
-    await accountsStore.bulkDisable(Array.from(selectedIds.value))
-    toast.success('批量禁用成功')
-    selectedIds.value = new Set()
+    const result = await accountsStore.bulkDisable(Array.from(selectedIds.value))
+    if (handleOpResult(result, '批量禁用成功', '批量禁用失败')) {
+      selectedIds.value = new Set()
+    }
   } catch (error: any) {
     toast.error(error.message || '批量禁用失败')
   }
 }
 
 const handleBulkDelete = async () => {
+  if (isOperating.value) return
   const confirmed = await confirmDialog.ask({
     title: '批量删除',
     message: '确定要批量删除选中的账号吗？',
@@ -1603,38 +2542,42 @@ const handleBulkDelete = async () => {
   })
   if (!confirmed) return
   try {
-    await accountsStore.bulkDelete(Array.from(selectedIds.value))
-    toast.success('批量删除成功')
-    selectedIds.value = new Set()
+    const result = await accountsStore.bulkDelete(Array.from(selectedIds.value))
+    if (handleOpResult(result, '批量删除成功', '批量删除失败')) {
+      selectedIds.value = new Set()
+    }
   } catch (error: any) {
     toast.error(error.message || '批量删除失败')
   }
 }
 
 const handleEnable = async (accountId: string) => {
+  if (isOperating.value) return
   try {
-    await accountsStore.enableAccount(accountId)
-    toast.success('账号已启用')
+    const result = await accountsStore.enableAccount(accountId)
+    handleOpResult(result, '账号已启用', '启用失败')
   } catch (error: any) {
     toast.error(error.message || '启用失败')
   }
 }
 
 const handleDisable = async (accountId: string) => {
+  if (isOperating.value) return
   const confirmed = await confirmDialog.ask({
     title: '禁用账号',
     message: '确定要禁用该账号吗？',
   })
   if (!confirmed) return
   try {
-    await accountsStore.disableAccount(accountId)
-    toast.success('账号已禁用')
+    const result = await accountsStore.disableAccount(accountId)
+    handleOpResult(result, '账号已禁用', '禁用失败')
   } catch (error: any) {
     toast.error(error.message || '禁用失败')
   }
 }
 
 const handleDelete = async (accountId: string) => {
+  if (isOperating.value) return
   const confirmed = await confirmDialog.ask({
     title: '删除账号',
     message: '确定要删除该账号吗？',
@@ -1642,8 +2585,8 @@ const handleDelete = async (accountId: string) => {
   })
   if (!confirmed) return
   try {
-    await accountsStore.deleteAccount(accountId)
-    toast.success('账号已删除')
+    const result = await accountsStore.deleteAccount(accountId)
+    handleOpResult(result, '账号已删除', '删除失败')
   } catch (error: any) {
     toast.error(error.message || '删除失败')
   }
@@ -1676,53 +2619,97 @@ const clearBackgroundTaskTimer = () => {
   backgroundTaskPending = false
 }
 
-const formatTaskStatus = (status: string) => {
-  if (status === 'pending') return '等待中'
-  if (status === 'running') return '执行中'
-  if (status === 'success') return '成功'
-  if (status === 'failed') return '失败'
-  return status
+const getTaskResultType = (
+  status: string,
+  success: number,
+  fail: number,
+  total?: number,
+) => {
+  if (status === 'pending' || status === 'running' || status === 'cancelled') return status
+  const s = Number.isFinite(success) ? success : 0
+  const f = Number.isFinite(fail) ? fail : 0
+  const t = Number.isFinite(total) ? total : s + f
+  if (s > 0 && f > 0) return 'partial'
+  if (s > 0 && f === 0) return 'success'
+  if (f > 0 && s === 0) return 'failed'
+  if (t === 0) return 'none'
+  return 'none'
+}
+
+const formatTaskStatus = (task: any) => {
+  const status = task?.status || ''
+  const success = task?.success_count ?? 0
+  const fail = task?.fail_count ?? 0
+  const total = Number.isFinite(task?.total) ? task.total : undefined
+  const result = getTaskResultType(status, success, fail, total)
+  if (result === 'pending') return '等待中'
+  if (result === 'running') return '执行中'
+  if (result === 'cancelled') return '已中断'
+  if (result === 'success') return '已完成（全部成功）'
+  if (result === 'failed') return '已完成（全部失败）'
+  if (result === 'partial') return '已完成（部分失败）'
+  return '已完成'
+}
+
+const getHistoryTotal = (record: any) => {
+  const total = Number.isFinite(record?.total) ? record.total : undefined
+  if (typeof total === 'number') return total
+  const progress = Number.isFinite(record?.progress) ? record.progress : 0
+  return progress
+}
+
+const getHistoryStatusTextClass = (record: any) => {
+  const status = record?.status
+  const success = record?.success_count ?? 0
+  const fail = record?.fail_count ?? 0
+  const total = getHistoryTotal(record)
+  const result = getTaskResultType(status, success, fail, total)
+  if (result === 'running' || result === 'pending') return 'text-sky-600'
+  if (result === 'success') return 'text-emerald-600'
+  if (result === 'failed') return 'text-rose-600'
+  if (result === 'partial') return 'text-amber-600'
+  if (result === 'cancelled') return 'text-muted-foreground'
+  return 'text-muted-foreground'
+}
+
+const getHistoryStatusIndicatorClass = (record: any) => {
+  const status = record?.status
+  const success = record?.success_count ?? 0
+  const fail = record?.fail_count ?? 0
+  const total = getHistoryTotal(record)
+  const result = getTaskResultType(status, success, fail, total)
+  if (result === 'running' || result === 'pending') return 'bg-sky-400'
+  if (result === 'success') return 'bg-emerald-400'
+  if (result === 'failed') return 'bg-rose-500'
+  if (result === 'partial') return 'bg-amber-400'
+  return 'bg-muted-foreground'
 }
 
 const getTaskStatusIndicatorClass = (task: RegisterTask | LoginTask) => {
   const status = task.status
   const success = task.success_count ?? 0
   const fail = task.fail_count ?? 0
-
-  // 执行中或等待中 - 蓝色
-  if (status === 'running' || status === 'pending') {
-    return 'bg-sky-400'
-  }
-
-  // 任务完成后根据成功失败情况判断
-  if (status === 'success' || status === 'failed') {
-    // 全部成功 - 绿色
-    if (success > 0 && fail === 0) {
-      return 'bg-emerald-400'
-    }
-    // 全部失败 - 红色
-    if (fail > 0 && success === 0) {
-      return 'bg-rose-500'
-    }
-    // 部分成功部分失败 - 黄色
-    if (success > 0 && fail > 0) {
-      return 'bg-amber-400'
-    }
-  }
-
-  // 默认灰色
+  const total = 'count' in task ? task.count : task.account_ids?.length
+  const result = getTaskResultType(status, success, fail, total)
+  if (result === 'running' || result === 'pending') return 'bg-sky-400'
+  if (result === 'success') return 'bg-emerald-400'
+  if (result === 'failed') return 'bg-rose-500'
+  if (result === 'partial') return 'bg-amber-400'
   return 'bg-muted-foreground'
 }
 
 const updateRegisterTask = async (taskId: string) => {
-  if (isClearedRegisterTaskId(taskId)) {
-    clearRegisterTimer()
-    return
-  }
-  const task = await accountsApi.getRegisterTask(taskId)
-  if (isClearedRegisterTaskId(task.id)) {
-    clearRegisterTimer()
-    return
+  let task: RegisterTask
+  try {
+    task = await accountsApi.getRegisterTask(taskId)
+  } catch (error: any) {
+    // 任务已不存在（被清理/过期/后端重启）：静默清理，避免弹窗显示 "Not found"
+    if (error?.status === 404 || error?.message === 'Not found') {
+      clearRegisterTimer()
+      isRegistering.value = false
+      return
+    }
+    throw error
   }
   syncRegisterTask(task)
   if (task.status !== 'running' && task.status !== 'pending') {
@@ -1742,20 +2729,35 @@ const updateRegisterTask = async (taskId: string) => {
     } else {
       toast.error('注册任务失败')
     }
+
+    await fetchTaskHistory()
+    return
   }
 }
 
 const updateLoginTask = async (taskId: string) => {
-  if (isClearedLoginTaskId(taskId)) {
-    clearLoginTimer()
-    return
-  }
-  const task = await accountsApi.getLoginTask(taskId)
-  if (isClearedLoginTaskId(task.id)) {
-    clearLoginTimer()
-    return
+  let task: LoginTask
+  try {
+    task = await accountsApi.getLoginTask(taskId)
+  } catch (error: any) {
+    // 任务已不存在（被清理/过期/后端重启）：静默清理，避免弹窗显示 "Not found"
+    if (error?.status === 404 || error?.message === 'Not found') {
+      clearLoginTimer()
+      isRefreshing.value = false
+      refreshingAccountIds.value = new Set()  // 清空刷新状态
+      return
+    }
+    throw error
   }
   syncLoginTask(task)
+
+  // 更新正在刷新的账户列表
+  if (task.status === 'running' || task.status === 'pending') {
+    refreshingAccountIds.value = new Set(task.account_ids || [])
+  } else {
+    refreshingAccountIds.value = new Set()  // 任务完成，清空刷新状态
+  }
+
   if (task.status !== 'running' && task.status !== 'pending') {
     isRefreshing.value = false
     clearLoginTimer()
@@ -1773,6 +2775,9 @@ const updateLoginTask = async (taskId: string) => {
     } else {
       toast.error('刷新任务失败')
     }
+
+    await fetchTaskHistory()
+    return
   }
 }
 
@@ -1817,31 +2822,8 @@ const startBackgroundTaskPolling = () => {
 }
 
 const loadCurrentTasks = async () => {
-  try {
-    const registerCurrent = await accountsApi.getRegisterCurrent()
-    if (registerCurrent && 'id' in registerCurrent && !isClearedRegisterTaskId(registerCurrent.id)) {
-      syncRegisterTask(registerCurrent)
-      if (registerCurrent.status === 'running' || registerCurrent.status === 'pending') {
-        isRegistering.value = true
-        startRegisterPolling(registerCurrent.id)
-      }
-    }
-  } catch (error: any) {
-    automationError.value = error.message || '加载注册任务失败'
-  }
-
-  try {
-    const loginCurrent = await accountsApi.getLoginCurrent()
-    if (loginCurrent && 'id' in loginCurrent && !isClearedLoginTaskId(loginCurrent.id)) {
-      syncLoginTask(loginCurrent)
-      if (loginCurrent.status === 'running' || loginCurrent.status === 'pending') {
-        isRefreshing.value = true
-        startLoginPolling(loginCurrent.id)
-      }
-    }
-  } catch (error: any) {
-    automationError.value = error.message || '加载刷新任务失败'
-  }
+  await loadCurrentTaskByKind('register')
+  await loadCurrentTaskByKind('login')
 }
 
 const handleRegister = async () => {
@@ -1851,7 +2833,7 @@ const handleRegister = async () => {
     const count = Number.isFinite(registerCount.value) && registerCount.value > 0
       ? registerCount.value
       : undefined
-    const task = await accountsApi.startRegister(count)
+    const task = await accountsApi.startRegister(count, undefined, selectedMailProvider.value)
     syncRegisterTask(task)
     startRegisterPolling(task.id)
     isRegisterOpen.value = false
@@ -1862,38 +2844,59 @@ const handleRegister = async () => {
   }
 }
 
-const handleRefreshSelected = async () => {
-  if (!selectedIds.value.size) return
+// 统一的刷新函数 - 所有刷新入口都调用这个
+const startRefresh = async (accountIds: string[]) => {
+  if (!accountIds.length) return
   automationError.value = ''
   isRefreshing.value = true
   try {
-    const task = await accountsApi.startLogin(Array.from(selectedIds.value))
+    const task = await accountsApi.startLogin(accountIds)
     syncLoginTask(task)
+    // 更新正在刷新的账户列表
+    refreshingAccountIds.value = new Set(task.account_ids || [])
     startLoginPolling(task.id)
     // 自动打开任务状态弹窗
     openTaskModal()
   } catch (error: any) {
     automationError.value = error.message || '启动刷新失败'
+    toast.error(error.message || '启动刷新失败')
     isRefreshing.value = false
   }
+}
+
+const handleRefreshSelected = async () => {
+  if (!selectedIds.value.size) return
+  await startRefresh(Array.from(selectedIds.value))
 }
 
 const handleRefreshExpiring = async () => {
   automationError.value = ''
   isRefreshing.value = true
   try {
-    await accountsApi.checkLogin()
+    const taskOrIdle = await accountsApi.checkLogin()
+    if (taskOrIdle && 'id' in taskOrIdle) {
+      syncLoginTask(taskOrIdle)
+      // 更新正在刷新的账户列表
+      refreshingAccountIds.value = new Set(taskOrIdle.account_ids || [])
+      startLoginPolling(taskOrIdle.id)
+      // 自动打开任务状态弹窗
+      openTaskModal()
+      return
+    }
+    // 没有新任务时，尝试读取当前任务（可能已有 running/pending）
     const current = await accountsApi.getLoginCurrent()
     if (current && 'id' in current) {
       syncLoginTask(current)
+      // 更新正在刷新的账户列表
+      refreshingAccountIds.value = new Set(current.account_ids || [])
       startLoginPolling(current.id)
-      // 自动打开任务状态弹窗
       openTaskModal()
       return
     }
     isRefreshing.value = false
   } catch (error: any) {
     automationError.value = error.message || '触发刷新失败'
+    toast.error(error.message || '触发刷新失败')
     isRefreshing.value = false
   }
 }
