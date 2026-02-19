@@ -82,13 +82,6 @@
       >
         自动刷新
       </button>
-      <button
-        class="rounded-full border border-border px-4 py-2 text-xs font-medium text-destructive transition-colors
-               hover:border-destructive/60"
-        @click="confirmOpen = true"
-      >
-        清空
-      </button>
     </div>
 
     <div v-if="statusMessage" class="mt-3 text-xs" :class="statusToneClass">

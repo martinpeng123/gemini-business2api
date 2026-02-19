@@ -1,4 +1,3 @@
-# linux构建需要删除package-lock.json，执行npm install来更新才能使用
 # Stage 1: 构建前端
 FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
@@ -6,7 +5,6 @@ WORKDIR /app/frontend
 # 先复制 package 文件利用 Docker 缓存
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm install --silent
-RUN npm install @rollup/rollup-linux-x64-gnu
 
 # 复制前端源码并构建
 COPY frontend/ ./
@@ -44,7 +42,7 @@ RUN apt-get update && \
 COPY main.py .
 COPY core ./core
 COPY util ./util
-COPY routers ./routers
+COPY scripts ./scripts
 
 # 从 builder 阶段只复制构建好的静态文件
 COPY --from=frontend-builder /app/static ./static

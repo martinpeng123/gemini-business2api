@@ -7,6 +7,7 @@ from typing import Optional
 import requests
 
 from core.mail_utils import extract_verification_code
+from core.proxy_utils import request_with_proxy_fallback
 
 
 class DuckMailClient:
@@ -46,7 +47,8 @@ class DuckMailClient:
             self._log("info", f"📦 请求体: {kwargs['json']}")
 
         try:
-            res = requests.request(
+            res = request_with_proxy_fallback(
+                requests.request,
                 method,
                 url,
                 proxies=self.proxies,
@@ -164,6 +166,42 @@ class DuckMailClient:
 
             self._log("info", f"📨 收到 {len(messages)} 封邮件，开始检查验证码...")
 
+            from datetime import datetime
+            import re
+
+            def _parse_message_time(msg_obj) -> Optional[datetime]:
+                created_at = msg_obj.get("createdAt")
+                if created_at is None:
+                    return None
+
+                if isinstance(created_at, (int, float)):
+                    timestamp = float(created_at)
+                    if timestamp > 1e12:
+                        timestamp = timestamp / 1000.0
+                    return datetime.fromtimestamp(timestamp).astimezone().replace(tzinfo=None)
+
+                if isinstance(created_at, str):
+                    raw = created_at.strip()
+                    if not raw:
+                        return None
+                    if raw.isdigit():
+                        timestamp = float(raw)
+                        if timestamp > 1e12:
+                            timestamp = timestamp / 1000.0
+                        return datetime.fromtimestamp(timestamp).astimezone().replace(tzinfo=None)
+
+                    # 截断纳秒到微秒（fromisoformat 只支持6位小数）
+                    raw = re.sub(r"(\.\d{6})\d+", r"\1", raw)
+                    return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
+
+                return None
+
+            # 按时间倒序，优先检查最新邮件
+            messages_with_time = [(msg, _parse_message_time(msg)) for msg in messages]
+            if any(item[1] is not None for item in messages_with_time):
+                messages_with_time.sort(key=lambda item: item[1] or datetime.min, reverse=True)
+                messages = [item[0] for item in messages_with_time]
+
             # 遍历邮件，过滤时间
             for idx, msg in enumerate(messages, 1):
                 msg_id = msg.get("id")
@@ -172,17 +210,9 @@ class DuckMailClient:
 
                 # 时间过滤
                 if since_time:
-                    created_at = msg.get("createdAt")
-                    if created_at:
-                        from datetime import datetime
-                        import re
-                        # 截断纳秒到微秒（fromisoformat 只支持6位小数）
-                        created_at = re.sub(r'(\.\d{6})\d+', r'\1', created_at)
-                        # 转换 UTC 时间到本地时区
-                        msg_time = datetime.fromisoformat(created_at.replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
-                        if msg_time < since_time:
-                            self._log("info", f"⏭️ 邮件 {idx} 时间过早，跳过")
-                            continue
+                    msg_time = _parse_message_time(msg)
+                    if msg_time and msg_time < since_time:
+                        continue
 
                 self._log("info", f"🔍 正在读取邮件 {idx}/{len(messages)} (ID: {msg_id[:10]}...)")
                 detail = self._request(
@@ -236,7 +266,7 @@ class DuckMailClient:
                 self._log("error", "❌ 登录失败，无法轮询验证码")
                 return None
 
-        max_retries = timeout // interval
+        max_retries = max(1, timeout // interval)
         self._log("info", f"⏱️ 开始轮询验证码 (超时 {timeout}秒, 间隔 {interval}秒, 最多 {max_retries} 次)")
 
         for i in range(1, max_retries + 1):
@@ -272,7 +302,3 @@ class DuckMailClient:
                 self.log_callback(level, message)
             except Exception:
                 pass
-
-    @staticmethod
-    def _extract_code(text: str) -> Optional[str]:
-        return extract_verification_code(text)

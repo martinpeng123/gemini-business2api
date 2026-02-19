@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Deque, Dict, Generic, List, Optional, TypeVar
 from collections import deque
 
-from core.account import update_accounts_config
+from core.account import RetryPolicy, update_accounts_config
 
 logger = logging.getLogger("gemini.base_task")
 
@@ -78,8 +78,7 @@ class BaseTaskService(Generic[T]):
         multi_account_mgr,
         http_client,
         user_agent: str,
-        account_failure_threshold: int,
-        rate_limit_cooldown_seconds: int,
+        retry_policy: RetryPolicy,
         session_cache_ttl_seconds: int,
         global_stats_provider: Callable[[], dict],
         set_multi_account_mgr: Optional[Callable[[Any], None]] = None,
@@ -92,8 +91,7 @@ class BaseTaskService(Generic[T]):
             multi_account_mgr: 多账户管理器
             http_client: HTTP客户端
             user_agent: 用户代理
-            account_failure_threshold: 账户失败阈值
-            rate_limit_cooldown_seconds: 速率限制冷却秒数
+            retry_policy: 重试策略
             session_cache_ttl_seconds: 会话缓存TTL秒数
             global_stats_provider: 全局统计提供者
             set_multi_account_mgr: 设置多账户管理器的回调
@@ -102,6 +100,7 @@ class BaseTaskService(Generic[T]):
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._tasks: Dict[str, T] = {}
         self._current_task_id: Optional[str] = None
+        self._last_task_id: Optional[str] = None
         self._lock = asyncio.Lock()
         self._log_lock = threading.Lock()
         self._log_prefix = log_prefix
@@ -114,8 +113,7 @@ class BaseTaskService(Generic[T]):
         self.multi_account_mgr = multi_account_mgr
         self.http_client = http_client
         self.user_agent = user_agent
-        self.account_failure_threshold = account_failure_threshold
-        self.rate_limit_cooldown_seconds = rate_limit_cooldown_seconds
+        self.retry_policy = retry_policy
         self.session_cache_ttl_seconds = session_cache_ttl_seconds
         self.global_stats_provider = global_stats_provider
         self.set_multi_account_mgr = set_multi_account_mgr
@@ -159,6 +157,8 @@ class BaseTaskService(Generic[T]):
                 task.status = TaskStatus.CANCELLED
                 task.finished_at = time.time()
                 self._append_log(task, "warning", f"task cancelled while pending: {reason}")
+                self._save_task_history_best_effort(task)
+                self._last_task_id = task.id
                 return task
 
             if task.status == TaskStatus.RUNNING:
@@ -240,6 +240,9 @@ class BaseTaskService(Generic[T]):
         finally:
             self._current_asyncio_task = None
             self._clear_cancel_hooks(task.id)
+            if task.status in (TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED) and task.finished_at:
+                self._save_task_history_best_effort(task)
+                self._last_task_id = task.id
 
     def _add_cancel_hook(self, task_id: str, hook: Callable[[], None]) -> None:
         """注册取消回调（线程安全）。"""
@@ -305,6 +308,14 @@ class BaseTaskService(Generic[T]):
             if not any(message.startswith(x) for x in safe_messages):
                 raise TaskCancelledError(task.cancel_reason or "cancelled")
 
+    def _save_task_history_best_effort(self, task: T) -> None:
+        try:
+            from main import save_task_to_history
+            task_type = "login" if self._log_prefix == "REFRESH" else "register"
+            save_task_to_history(task_type, task.to_dict())
+        except Exception:
+            pass
+
     def _apply_accounts_update(self, accounts_data: list) -> None:
         """
         应用账户更新
@@ -318,8 +329,7 @@ class BaseTaskService(Generic[T]):
             self.multi_account_mgr,
             self.http_client,
             self.user_agent,
-            self.account_failure_threshold,
-            self.rate_limit_cooldown_seconds,
+            self.retry_policy,
             self.session_cache_ttl_seconds,
             global_stats,
         )

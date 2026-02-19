@@ -9,6 +9,9 @@ import requests
 
 from core.mail_utils import extract_verification_code
 
+# 常量定义
+CANCELLATION_CHECK_INTERVAL_SECONDS = 5  # 取消检查间隔（秒）
+
 
 class MicrosoftMailClient:
     def __init__(
@@ -155,13 +158,22 @@ class MicrosoftMailClient:
         self._log("info", f"⏱️ 开始轮询验证码 (超时 {timeout}秒, 间隔 {interval}秒, 最多 {max_retries} 次)")
 
         for i in range(1, max_retries + 1):
+            # 检查任务是否被取消（通过 log 触发 TaskCancelledError）
             self._log("info", f"🔄 第 {i}/{max_retries} 次轮询...")
             code = self.fetch_verification_code(since_time=since_time)
             if code:
                 self._log("info", f"🎉 验证码获取成功: {code}")
                 return code
             if i < max_retries:
-                time.sleep(interval)
+                # 分段 sleep，每5秒检查一次取消状态
+                for _ in range(interval // CANCELLATION_CHECK_INTERVAL_SECONDS):
+                    time.sleep(CANCELLATION_CHECK_INTERVAL_SECONDS)
+                    # 通过 log 检查取消状态（使用有意义的日志）
+                    self._log("debug", f"等待验证码中... ({(_ + 1) * CANCELLATION_CHECK_INTERVAL_SECONDS}/{interval}秒)")
+                # 处理剩余的秒数
+                remaining = interval % CANCELLATION_CHECK_INTERVAL_SECONDS
+                if remaining > 0:
+                    time.sleep(remaining)
 
         self._log("error", "❌ 验证码获取超时")
         return None
@@ -203,5 +215,7 @@ class MicrosoftMailClient:
         if self.log_callback:
             try:
                 self.log_callback(level, message)
+            except TaskCancelledError:
+                raise
             except Exception:
                 pass

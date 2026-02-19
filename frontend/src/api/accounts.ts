@@ -45,9 +45,15 @@ export const accountsApi = {
       '/admin/accounts/bulk-disable',
       accountIds
     ),
+  // 批量删除账户（最多50个）
+  bulkDelete: (accountIds: string[]) =>
+    apiClient.put<never, { status: string; success_count: number; errors: string[] }>(
+      '/admin/accounts/bulk-delete',
+      accountIds
+    ),
 
-  startRegister: (count?: number, domain?: string) =>
-    apiClient.post<never, RegisterTask>('/admin/register/start', { count, domain }),
+  startRegister: (count?: number, domain?: string, mail_provider?: string) =>
+    apiClient.post<never, RegisterTask>('/admin/register/start', { count, domain, mail_provider }),
 
   getRegisterTask: (taskId: string) =>
     apiClient.get<never, RegisterTask>(`/admin/register/task/${taskId}`),
