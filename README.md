@@ -49,6 +49,47 @@
 - ✅ 内置管理面板 - 在线配置与账号管理
 - ✅ 可选 PostgreSQL 后端 - 支持账户/设置/统计持久化 [感谢PR](https://github.com/Dreamy-rain/gemini-business2api/pull/4)
 
+## 🔧 Claude Tool Calling 支持（实验性）
+
+⚠️ **重要提示**：经测试，当前版本**不支持工具调用功能**。该功能依赖于 Gemini API 的 function calling 能力，目前后端 API 尚未完全支持。
+
+### 协议转换实现
+
+本项目已实现 Claude 与 OpenAI 工具调用协议的双向转换，代码已就绪，等待后端 API 支持。
+
+#### Claude → OpenAI（请求转换）
+
+| Claude | OpenAI | 说明 |
+|--------|--------|------|
+| `tools[].input_schema` | `tools[].function.parameters` | 参数定义 |
+| `tool_choice: {type: "auto"}` | `"auto"` | 自动选择 |
+| `tool_choice: {type: "any"}` | `"required"` | 必须调用 |
+| `content[].type: "tool_use"` | `tool_calls[]` | 工具调用 |
+| `content[].type: "tool_result"` | `role: "tool"` | 工具结果 |
+
+#### OpenAI → Claude（响应转换）
+
+| OpenAI | Claude | 说明 |
+|--------|--------|------|
+| `tool_calls[]` | `content[].type: "tool_use"` | 工具调用块 |
+| `function.arguments` (JSON 字符串) | `input` (对象) | 参数格式 |
+| `finish_reason: "tool_calls"` | `stop_reason: "tool_use"` | 停止原因 |
+
+### 实现特性
+
+- ✅ 完整的双向协议转换（Claude ↔ OpenAI）
+- ✅ 支持工具定义、工具调用、工具结果的完整流程
+- ✅ 向后兼容，不影响现有功能
+- ✅ 支持流式和非流式响应
+- ⚠️ 等待 Gemini API 后端支持
+
+### 技术文档
+
+详细的设计和实现文档：
+- `TOOL_CALLING_DESIGN.md` - 设计方案和协议对比
+- `IMPLEMENTATION_SUMMARY.md` - 实现总结和使用示例
+- `TESTING_GUIDE.md` - 测试指南
+
 ## 🤖 模型功能
 
 | 模型ID                   | 识图 | 原生联网 | 文件多模态 | 图片生成 | 视频生成 |

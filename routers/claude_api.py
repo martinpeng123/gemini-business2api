@@ -58,6 +58,8 @@ class ClaudeRequest(BaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     stop_sequences: Optional[List[str]] = None
+    tools: Optional[List[Dict[str, Any]]] = None  # 工具定义列表
+    tool_choice: Optional[Dict[str, Any]] = None  # 工具选择策略
 
 
 # ========== Claude API 响应模型 ==========
@@ -88,12 +90,54 @@ class ClaudeError(BaseModel):
 
 # ========== 工具函数 ==========
 
-def claude_to_openai_messages(claude_req: ClaudeRequest) -> tuple[List[Dict[str, Any]], Optional[str]]:
+def convert_claude_tools_to_openai(claude_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    将 Claude 工具定义转换为 OpenAI 格式
+
+    Claude: {"name": "x", "description": "y", "input_schema": {...}}
+    OpenAI: {"type": "function", "function": {"name": "x", "description": "y", "parameters": {...}}}
+    """
+    openai_tools = []
+    for tool in claude_tools:
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": tool.get("name"),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema", {})
+            }
+        })
+    return openai_tools
+
+
+def convert_claude_tool_choice_to_openai(claude_tool_choice: Dict[str, Any]) -> Union[str, Dict[str, Any]]:
+    """
+    将 Claude tool_choice 转换为 OpenAI 格式
+
+    Claude: {"type": "auto"} | {"type": "any"} | {"type": "tool", "name": "xxx"}
+    OpenAI: "auto" | "required" | {"type": "function", "function": {"name": "xxx"}}
+    """
+    choice_type = claude_tool_choice.get("type")
+
+    if choice_type == "auto":
+        return "auto"
+    elif choice_type == "any":
+        return "required"
+    elif choice_type == "tool":
+        return {
+            "type": "function",
+            "function": {"name": claude_tool_choice.get("name")}
+        }
+    else:
+        return "auto"
+
+
+def claude_to_openai_messages(claude_req: ClaudeRequest) -> tuple[List[Dict[str, Any]], Optional[str], Optional[List[Dict[str, Any]]], Optional[Union[str, Dict[str, Any]]]]:
     """
     将 Claude 格式的请求转换为 OpenAI 格式
 
     Returns:
-        (messages, system_prompt): OpenAI格式消息列表和系统提示词
+        (messages, system_prompt, tools, tool_choice): OpenAI格式消息列表、系统提示词、工具列表、工具选择策略
     """
     messages = []
 
@@ -110,6 +154,14 @@ def claude_to_openai_messages(claude_req: ClaudeRequest) -> tuple[List[Dict[str,
                     texts.append(block.get("text", ""))
             system_prompt = "\n".join(texts) if texts else None
 
+    # 转换 tools 和 tool_choice
+    openai_tools = None
+    openai_tool_choice = None
+    if claude_req.tools:
+        openai_tools = convert_claude_tools_to_openai(claude_req.tools)
+        if claude_req.tool_choice:
+            openai_tool_choice = convert_claude_tool_choice_to_openai(claude_req.tool_choice)
+
     for msg in claude_req.messages:
         role = msg.role
         content = msg.content
@@ -123,8 +175,11 @@ def claude_to_openai_messages(claude_req: ClaudeRequest) -> tuple[List[Dict[str,
             # 纯文本
             messages.append({"role": role, "content": content})
         elif isinstance(content, list):
-            # 内容块列表（多模态）
-            content_list = []
+            # 内容块列表（多模态/工具调用）
+            text_parts = []
+            tool_calls = []
+            tool_results = []
+
             for block in content:
                 if not isinstance(block, dict):
                     continue
@@ -134,7 +189,8 @@ def claude_to_openai_messages(claude_req: ClaudeRequest) -> tuple[List[Dict[str,
                 if block_type == "text":
                     text = block.get("text", "")
                     if text:
-                        content_list.append({"type": "text", "text": text})
+                        text_parts.append({"type": "text", "text": text})
+
                 elif block_type == "image":
                     source = block.get("source", {})
                     media_type = source.get("media_type", "image/jpeg")
@@ -143,20 +199,56 @@ def claude_to_openai_messages(claude_req: ClaudeRequest) -> tuple[List[Dict[str,
                     if data:
                         # Claude 的 base64 数据通常不带前缀，需要添加
                         if not data.startswith("data:"):
-                            content_list.append({
+                            text_parts.append({
                                 "type": "image_url",
                                 "image_url": {"url": f"data:{media_type};base64,{data}"}
                             })
                         else:
-                            content_list.append({
+                            text_parts.append({
                                 "type": "image_url",
                                 "image_url": {"url": data}
                             })
 
-            if content_list:
-                messages.append({"role": role, "content": content_list})
+                elif block_type == "tool_use":
+                    # Claude tool_use -> OpenAI tool_calls
+                    tool_calls.append({
+                        "id": block.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name"),
+                            "arguments": json.dumps(block.get("input", {}))
+                        }
+                    })
 
-    return messages, system_prompt
+                elif block_type == "tool_result":
+                    # Claude tool_result -> OpenAI tool role message
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": block.get("tool_use_id"),
+                        "content": block.get("content", "")
+                    })
+
+            # 构建消息
+            if role == "assistant" and tool_calls:
+                # Assistant 消息包含工具调用
+                msg_dict = {"role": "assistant"}
+                if text_parts:
+                    # 如果有文本内容，提取纯文本
+                    text_content = " ".join([p.get("text", "") for p in text_parts if p.get("type") == "text"])
+                    if text_content:
+                        msg_dict["content"] = text_content
+                msg_dict["tool_calls"] = tool_calls
+                messages.append(msg_dict)
+
+            elif role == "user" and tool_results:
+                # User 消息包含工具结果，转换为 tool 角色消息
+                messages.extend(tool_results)
+
+            elif text_parts:
+                # 普通消息（文本/图片）
+                messages.append({"role": role, "content": text_parts})
+
+    return messages, system_prompt, openai_tools, openai_tool_choice
 
 
 def openai_to_claude_response(
@@ -167,17 +259,56 @@ def openai_to_claude_response(
     """
     将 OpenAI 格式的响应转换为 Claude 格式
     """
-    content = openai_response.get("choices", [{}])[0].get("message", {})
-    text_content = content.get("content", "")
+    choice = openai_response.get("choices", [{}])[0]
+    message = choice.get("message", {})
+    text_content = message.get("content", "")
+    tool_calls = message.get("tool_calls", [])
     usage = openai_response.get("usage", {})
+
+    # 构建 content 数组
+    content_blocks = []
+
+    # 添加文本内容
+    if text_content:
+        content_blocks.append({"type": "text", "text": text_content})
+
+    # 转换 tool_calls 为 Claude tool_use 格式
+    for tool_call in tool_calls:
+        if tool_call.get("type") == "function":
+            function = tool_call.get("function", {})
+            # 解析 arguments JSON 字符串
+            try:
+                arguments = json.loads(function.get("arguments", "{}"))
+            except json.JSONDecodeError:
+                arguments = {}
+
+            content_blocks.append({
+                "type": "tool_use",
+                "id": tool_call.get("id"),
+                "name": function.get("name"),
+                "input": arguments
+            })
+
+    # 如果没有任何内容块，添加空文本
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": ""})
+
+    # 确定 stop_reason
+    finish_reason = choice.get("finish_reason", "stop")
+    if finish_reason == "tool_calls":
+        stop_reason = "tool_use"
+    elif finish_reason == "length":
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
 
     return {
         "id": message_id,
         "type": "message",
         "role": "assistant",
-        "content": [{"type": "text", "text": text_content}],
+        "content": content_blocks,
         "model": model,
-        "stop_reason": "end_turn",
+        "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
             "input_tokens": usage.get("prompt_tokens", 0),
@@ -278,7 +409,11 @@ async def claude_messages(
         )
 
     # 转换为 OpenAI 格式
-    messages, system_prompt = claude_to_openai_messages(claude_req)
+    messages, system_prompt, openai_tools, openai_tool_choice = claude_to_openai_messages(claude_req)
+
+    # 记录工具调用信息
+    if openai_tools:
+        logger.info(f"[CLAUDE-API] 工具调用: tools={len(openai_tools)}, tool_choice={openai_tool_choice}")
 
     # Gemini 优化：使用精简的 system prompt 避免 Payload 过大导致 429 限流
     GEMINI_OPTIMIZED_SYSTEM_PROMPT = """You are an AI coding assistant.
@@ -332,6 +467,10 @@ Tone:
         openai_req["temperature"] = claude_req.temperature
     if claude_req.top_p is not None:
         openai_req["top_p"] = claude_req.top_p
+    if openai_tools:
+        openai_req["tools"] = openai_tools
+    if openai_tool_choice:
+        openai_req["tool_choice"] = openai_tool_choice
 
     # 调用内部 chat 实现
     from main import chat_impl, ChatRequest

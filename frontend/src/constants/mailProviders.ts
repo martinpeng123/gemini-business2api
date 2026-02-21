@@ -7,4 +7,4 @@ export const mailProviderOptions = [
 
 export type TempMailProvider = typeof mailProviderOptions[number]['value']
 
-export const defaultMailProvider: TempMailProvider = 'moemail'
+export const defaultMailProvider: TempMailProvider = 'duckmail'
